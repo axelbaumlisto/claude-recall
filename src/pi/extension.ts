@@ -161,10 +161,9 @@ export default function(pi: PiTypes.ExtensionAPI) {
       // store, "self-verify before done" — a rule living in AGENTS.md, not the
       // database — matched an unrelated note at containment 1.0 just because it
       // was long enough to contain both words.
-      if (injectedThisTurn.length === 0) return;
-
-      const ms = MemoryService.getInstance();
+      // No candidates means no credit, but the citation still gets logged below.
       const matches = matchCitations(citations, injectedThisTurn);
+      const ms = MemoryService.getInstance();
 
       for (const { key } of matches) {
         ms.incrementCiteCount(key);
@@ -173,13 +172,17 @@ export default function(pi: PiTypes.ExtensionAPI) {
         } catch { /* best-effort — ignore */ }
       }
 
-      if (matches.length > 0) {
-        LoggingService.getInstance().info(
-          'pi-extension',
-          `Credited ${matches.length} of ${citations.length} citation(s)`,
-          { keys: matches.map(m => m.key) },
-        );
-      }
+      // Log the refusals too: a citation we decline to attribute is the only
+      // way to tell "the model cited a rule of ours" from "it cited CLAUDE.md".
+      const credited = new Set(matches.map(m => m.citation));
+      LoggingService.getInstance().info(
+        'pi-extension',
+        `Credited ${matches.length} of ${citations.length} citation(s)`,
+        {
+          keys: matches.map(m => m.key),
+          uncredited: citations.filter(c => !credited.has(c)).map(c => truncateStr(c, 80)),
+        },
+      );
     } catch {
       // Never let bookkeeping break a turn
     }
