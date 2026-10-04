@@ -71,7 +71,12 @@ export class DatabaseManager {
    */
   async compactIfDue(minIntervalMs: number = DatabaseManager.DEFAULT_COMPACTION_INTERVAL_MS): Promise<CompactionResult | null> {
     try {
-      const marker = path.join(path.dirname(this.config.getDatabasePath()), '.last-compaction');
+      const dbPath = this.config.getDatabasePath();
+      // A host that has never stored anything has nothing to compact, and
+      // shouldCompact() would stat a missing file and log the ENOENT as an error.
+      if (!fs.existsSync(dbPath)) return null;
+
+      const marker = path.join(path.dirname(dbPath), '.last-compaction');
       const lastRun = fs.existsSync(marker) ? fs.statSync(marker).mtimeMs : 0;
       if (Date.now() - lastRun < minIntervalMs) return null;
 

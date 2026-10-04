@@ -198,6 +198,16 @@ describe('compaction retention', () => {
       expect(await DatabaseManager.getInstance().compactIfDue()).not.toBeNull();
     });
 
+    it('stays quiet on a host that has never stored anything', async () => {
+      fs.rmSync(dbPath);
+      const errors = jest.spyOn(console, 'error').mockImplementation(() => {});
+
+      await expect(DatabaseManager.getInstance().compactIfDue()).resolves.toBeNull();
+      expect(fs.existsSync(path.join(dir, '.last-compaction'))).toBe(false);
+
+      errors.mockRestore();
+    });
+
     it('returns null instead of throwing when the database is unreadable', async () => {
       fs.rmSync(dbPath);
 
