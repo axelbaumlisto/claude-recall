@@ -178,11 +178,32 @@ export async function distilSession(input: {
   /** Interactions the runtime already has, when it has them (Pi). */
   interactions?: ToolInteraction[];
   failures?: DetectedFailure[];
+  /**
+   * Give up distilling after this long and still promote what is already
+   * stored. In-process runtimes keep the process alive until this resolves, so
+   * an unbounded pass delays the user's exit by one LLM call per failure.
+   */
+  deadlineMs?: number;
 }): Promise<void> {
   const detected = storeDetectedFailures(input.entries, input.interactions);
   const all = [...detected, ...(input.failures ?? [])];
+
   if (all.length > 0) {
-    await generateCandidateLessons(all, input.episodeId, input.projectId);
+    const lessons = generateCandidateLessons(all, input.episodeId, input.projectId);
+    if (input.deadlineMs === undefined) {
+      await lessons;
+    } else {
+      let timer: NodeJS.Timeout | undefined;
+      const deadline = new Promise<void>((resolve) => {
+        timer = setTimeout(() => {
+          hookLog(LOG_TAG, `deadline reached after ${input.deadlineMs}ms — promoting what is stored`);
+          resolve();
+        }, input.deadlineMs);
+      });
+      await Promise.race([lessons, deadline]);
+      if (timer) clearTimeout(timer);
+    }
   }
+
   runPromotionCycle(input.projectId);
 }
