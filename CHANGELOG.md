@@ -5,6 +5,18 @@ All notable changes to this project will be documented in this file.
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.0.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Pi hosts can use an LLM again — through Pi itself.** Capture classification, session learnings, checkpoint extraction and hindsight hints all need a model, and the backends were `claude -p`, `kiro-cli` and an opt-in Anthropic key. A Pi-only machine has none of those, so every one of those features was silently inert there. Pi ships the same affordance the other runtimes do — `pi -p` answers on the model the user already configured — so it needs no API key either. The nested call runs with `--no-extensions`, which is a stronger recursion guard than an environment flag: the child cannot load claude-recall at all. New: `CLAUDE_RECALL_PI_MODEL`, `CLAUDE_RECALL_PI_LLM_TIMEOUT_MS`.
+
+  The backend is gated on the Pi extension announcing the runtime, not on `pi` being on PATH — a Claude Code user who also has Pi installed must not have their hooks quietly answered by a different agent.
+
+### Changed
+
+- **The three runtime CLI backends share one implementation** (`src/hooks/runtime-cli.ts`). `completeWithClaudeCli` and `completeWithKiroCli` were the same spawn, timeout, kill and stdout handling with different argv; adding a third copy for Pi would have made three.
+
 ## [0.43.0] - 2026-09-30
 
 ### Added
