@@ -9,6 +9,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Fixed
 
+## [Unreleased]
+
 - **Retention is now enforced on every host, and on the tables that actually grow.** Compaction only ever ran from the MCP server's boot path, so a Pi-only machine never compacted at all: `maxMemories` printed `Memory usage at 240% (24030/10000)` on every store while the database kept growing (measured: 133MB, 24032 memories). Two gaps made that unbounded even where compaction did run — `failure`, the highest-volume automatic write (23532 of those rows), had no retention, and outcome telemetry (`outcome_events` at 246845 rows, about two thirds of the file) had none at all. Since failures are a rule type, every turn loaded them: 5059 rules / 3.05MB / 80.6ms per turn, against 14.6ms once capped. Pi's `session_start` now calls the same compaction the MCP boot path does, via a shared `compactIfDue()` **throttled to once a day per database** (`compactThreshold` is 10MB, so `shouldCompact()` is true for most working databases, and compaction copies a backup and VACUUMs — without a floor, a host opening a session a minute would pay that every minute). Maintenance never throws: it must not keep a session or a server from starting.
 
 ### Added
@@ -19,6 +21,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`pruneOldToolUse` and `pruneOldCorrections` collapsed into `pruneByType`** — they were the same function with a different type literal, and failures want the same policy.
 - **`getCompactionConfig` merges the stored config over the defaults** instead of replacing them. A config file written before this change has a `compaction` block without the new retention keys, and an undefined cap would reach `scored.slice(keepCount)` and select every row for deletion.
+
+- **Raw outcome telemetry is no longer collected on runtimes that cannot consume it.** `outcome_events` and `rule_injection_events` are written one row per tool result so that `memory-stop-hook` can later distill them into `candidate_lessons` and citation counts — but that hook is wired into Claude Code's hook CLI only. Under Pi the rows were therefore written and never read: one host reached **246845 `outcome_events` rows, about two thirds of a 133MB database, with `candidate_lessons` still empty and every `cite_count` at zero**. `rule_injection_events` is worse off still — `getInjectionStats`, its only reader, has no callers on any runtime. Collection now follows the consumer, via one pure policy function (`shouldRecordOutcomes`) that both writers consult.
+
+### Added
+
+- **`CLAUDE_RECALL_OUTCOME_TRACKING`** (`auto` | `on` | `off`, default `auto`). `auto` collects where the distillation step runs; `on` forces collection everywhere, which is what you want when reading the `outcomes` CLI or debugging capture; `off` disables it entirely. Failure memories are unaffected — Pi reads those back as rules.
 
 ## [0.43.0] - 2026-09-30
 
