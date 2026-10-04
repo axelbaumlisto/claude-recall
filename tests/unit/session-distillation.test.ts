@@ -32,6 +32,7 @@ jest.mock('../../src/hooks/shared', () => ({
 	safeErrorMessage: (e: any) => String(e),
 	searchExisting: mockSearchExisting,
 	isDuplicate: jest.requireActual('../../src/hooks/shared').isDuplicate,
+	comparableText: jest.requireActual('../../src/hooks/shared').comparableText,
 }));
 
 import { distilSession, runPromotionCycle, storeDetectedFailures } from '../../src/shared/session-distillation';
@@ -65,6 +66,18 @@ describe('session distillation', () => {
 			expect(stored).toHaveLength(1);
 			expect(mockStore).toHaveBeenCalledTimes(1);
 			expect(mockStore.mock.calls[0][0].type).toBe('failure');
+		});
+
+		it('recognises a repeat of a detector-written failure, not just a captured one', () => {
+			// Stored failures carry { what_failed, why_failed, … }; comparing against
+			// the whole JSON blob used to drown the text and let repeats through.
+			mockDetect.mockReturnValue([failure('npm test exited 1')]);
+			mockSearchExisting.mockReturnValue([
+				{ value: { what_failed: 'npm test exited 1', why_failed: 'Exit code 1', context: 'tests' }, score: 1 },
+			]);
+
+			expect(storeDetectedFailures([{ role: 'assistant' }])).toHaveLength(0);
+			expect(mockStore).not.toHaveBeenCalled();
 		});
 
 		it('skips a failure already stored', () => {
@@ -109,6 +122,26 @@ describe('session distillation', () => {
 				lesson_kind: 'rule',
 				applies_when: ['tests'],
 			});
+		});
+
+		it('does not pay for hindsight about a failure it already learned from', async () => {
+			mockDetect.mockReturnValue([failure('npm test exited 1')]);
+			mockFindSimilar.mockReturnValue([{ id: 'lesson-1' }]);
+
+			await distilSession({ entries: [{ role: 'assistant' }], projectId: 'proj', episodeId: 'ep1' });
+
+			// The repeat counts as evidence, and the model is never asked.
+			expect(mockIncrementEvidence).toHaveBeenCalledWith('lesson-1');
+			expect(mockHint).not.toHaveBeenCalled();
+		});
+
+		it('asks the model only about a failure it has not seen', async () => {
+			mockDetect.mockReturnValue([failure('a brand new failure')]);
+			mockFindSimilar.mockReturnValue([]);
+
+			await distilSession({ entries: [{ role: 'assistant' }], projectId: 'proj', episodeId: 'ep1' });
+
+			expect(mockHint).toHaveBeenCalledTimes(1);
 		});
 
 		it('counts evidence instead of duplicating an existing lesson', async () => {

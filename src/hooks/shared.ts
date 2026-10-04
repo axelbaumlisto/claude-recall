@@ -241,14 +241,31 @@ export function isDuplicate(
   threshold: number = 0.7
 ): boolean {
   for (const mem of existingMemories) {
-    const memContent = typeof mem.value === 'string'
-      ? mem.value
-      : JSON.stringify(mem.value);
-    if (jaccardSimilarity(content, memContent) >= threshold) {
+    if (jaccardSimilarity(content, comparableText(mem.value)) >= threshold) {
       return true;
     }
   }
   return false;
+}
+
+/**
+ * The part of a stored memory worth comparing.
+ *
+ * Comparing against `JSON.stringify(value)` drowned the text in field names
+ * and metadata: an identical repeat of a detector-written failure
+ * ({ what_failed, why_failed, context, … }) scored far under the threshold, so
+ * every repeat was stored again — and, downstream, bought another hindsight
+ * call from the model to relearn what was already known.
+ */
+export function comparableText(value: unknown): string {
+  if (typeof value === 'string') return value;
+  if (!value || typeof value !== 'object') return String(value ?? '');
+
+  const v = value as Record<string, unknown>;
+  const parts = [v.what_failed, v.content, v.value, v.title, v.text]
+    .filter((x): x is string => typeof x === 'string');
+
+  return parts.length > 0 ? parts.join(' ') : JSON.stringify(value);
 }
 
 /**
