@@ -11,6 +11,8 @@ import { MemoryService, ActiveRules } from '../services/memory';
 import { ConfigService } from '../services/config';
 import { OutcomeStorage } from '../services/outcome-storage';
 import { LoggingService } from '../services/logging';
+import { distilSession } from '../shared/session-distillation';
+import type { ToolInteraction as PiToolInteraction } from '../hooks/shared';
 import {
   processToolOutcome,
   processUserInput,
@@ -102,9 +104,14 @@ export default function(pi: PiTypes.ExtensionAPI) {
   // user who also has Pi installed would get their hooks answered by it.
   process.env.CLAUDE_RECALL_RUNTIME = 'pi';
 
+  /** Longest a session may spend distilling before it is allowed to exit. */
+  const DISTILLATION_DEADLINE_MS = 20000;
+
   let projectId: string = '';
   const sessionId: string = `pi_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
   const collectedToolResults: ConversationEntry[] = [];
+  /** Tool calls and their outcomes, in the shape the failure detectors want. */
+  const toolInteractions: PiToolInteraction[] = [];
   let rulesLoaded = false;
   const collectedUserTexts: string[] = [];
   // Chronologically interleaved entries (user input + tool results in order)
@@ -127,6 +134,7 @@ export default function(pi: PiTypes.ExtensionAPI) {
     collectedUserTexts.length = 0;
     collectedToolResults.length = 0;
     collectedEntries.length = 0;
+    toolInteractions.length = 0;
     resetPendingFailures();
     try {
       ConfigService.getInstance().updateConfig({
@@ -216,6 +224,22 @@ export default function(pi: PiTypes.ExtensionAPI) {
     const result = processToolOutcome(event.toolName, event.input, output, event.isError, sessionId);
 
     // Collect for session extraction
+    toolInteractions.push({
+      call: {
+        id: event.toolCallId,
+        name: event.toolName,
+        input: event.input,
+        entryIndex: toolInteractions.length,
+      },
+      result: {
+        toolUseId: event.toolCallId,
+        content: output,
+        isError: event.isError,
+        entryIndex: toolInteractions.length,
+      },
+    });
+    if (toolInteractions.length > MAX_COLLECTED_ENTRIES) toolInteractions.shift();
+
     collectedToolResults.push({
       role: 'tool_result',
       text: output.substring(0, 300),
@@ -291,6 +315,30 @@ export default function(pi: PiTypes.ExtensionAPI) {
           try { ctx.ui.notify(`🔍 Recall: extracted ${extracted} learnings from session`, 'info'); } catch { /* non-critical */ }
         }
       }).catch(() => {});
+    }
+
+    // Distil this session's failures into candidate lessons and promote what
+    // has earned it. Until now this ran only from Claude Code's Stop hook, so
+    // on a Pi host failures accumulated as rules and never became lessons.
+    // Bounded: Pi keeps the process alive until this resolves, and a session
+    // must not take a minute to exit because it is still asking about failures.
+    if (collectedEntries.length > 0 && projectId) {
+      void (async () => {
+        try {
+          const episodeId = OutcomeStorage.getInstance().createEpisode({
+            project_id: projectId,
+            session_id: sessionId,
+            source: 'pi',
+          } as any);
+          await distilSession({
+            entries: collectedEntries,
+            projectId,
+            episodeId,
+            interactions: toolInteractions,
+            deadlineMs: DISTILLATION_DEADLINE_MS,
+          });
+        } catch { /* a session must end whether or not it taught us anything */ }
+      })();
     }
 
     // Auto-checkpoint: extract "where I left off" hint for next Pi session.
