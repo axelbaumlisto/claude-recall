@@ -187,13 +187,17 @@ export default function(pi: PiTypes.ExtensionAPI) {
         } catch { /* best-effort — ignore */ }
       }
 
-      if (matches.length > 0) {
-        LoggingService.getInstance().info(
-          'pi-extension',
-          `Credited ${matches.length} of ${citations.length} citation(s)`,
-          { keys: matches.map(m => m.key) },
-        );
-      }
+      // Log the refusals too: a citation we decline to attribute is the only
+      // way to tell "the model cited a rule of ours" from "it cited CLAUDE.md".
+      const credited = new Set(matches.map(m => m.citation));
+      LoggingService.getInstance().info(
+        'pi-extension',
+        `Credited ${matches.length} of ${citations.length} citation(s)`,
+        {
+          keys: matches.map(m => m.key),
+          uncredited: citations.filter(c => !credited.has(c)).map(c => truncateStr(c, 80)),
+        },
+      );
     } catch {
       // Never let bookkeeping break a turn
     }
