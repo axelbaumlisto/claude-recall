@@ -23,11 +23,10 @@ import * as fs from 'fs';
 import * as path from 'path';
 import { MemoryService } from '../services/memory';
 import { ConfigService } from '../services/config';
-import { detectTranscriptFailures } from './failure-detectors';
 import { DetectedFailure } from './failure-detectors';
-import { extractHindsightHint } from './llm-classifier';
 import { OutcomeStorage } from '../services/outcome-storage';
 import { extractCitations, matchCitations } from '../shared/citations';
+import { generateCandidateLessons, runPromotionCycle, storeDetectedFailures } from '../shared/session-distillation';
 import { extractSessionLearnings, ConversationEntry, setLogFunction } from '../shared/event-processors';
 
 const MAX_STORE = 3;
@@ -203,19 +202,7 @@ export async function handleMemoryStop(input: any): Promise<void> {
   // Generate candidate lessons from high-confidence failures
   await generateCandidateLessons(allFailures, episodeId, projectId);
 
-  // Run promotion cycle
-  try {
-    const { PromotionEngine } = await import('../services/promotion-engine');
-    const result = PromotionEngine.getInstance().runCycle(projectId);
-    if (result.promoted > 0 || result.archived > 0) {
-      if (result.promoted > 0) {
-        console.log(`⬆️ Recall: ${result.promoted} lesson(s) promoted to active rules`);
-      }
-      hookLog('memory-stop', `Promotion: ${result.promoted} promoted, ${result.archived} archived`);
-    }
-  } catch (err) {
-    hookLog('memory-stop', `Promotion error: ${safeErrorMessage(err)}`);
-  }
+  runPromotionCycle(projectId);
 
   // Prune old outcome data to prevent unbounded table growth
   try {
@@ -292,61 +279,7 @@ function scanForCitations(transcriptPath: string): void {
  * Scan the last 200 transcript entries for failure signals and store up to 3.
  */
 function detectAndStoreFailures(transcriptPath: string, _episodeId?: string): DetectedFailure[] {
-  try {
-    const entries = readTranscriptTail(transcriptPath, 200);
-    if (entries.length === 0) {
-      hookLog('memory-stop', '[FailureDetector] No entries to scan');
-      return [];
-    }
-
-    const failures = detectTranscriptFailures(entries);
-    if (failures.length === 0) {
-      hookLog('memory-stop', '[FailureDetector] No failure signals detected');
-      return [];
-    }
-
-    hookLog('memory-stop', `[FailureDetector] Detected ${failures.length} failure signal(s)`);
-
-    const projectId = ConfigService.getInstance().getProjectId();
-    let stored = 0;
-
-    for (const failure of failures) {
-      // Dedup against existing failure memories
-      const searchQuery = failure.content.what_failed.substring(0, 100);
-      const existing = searchExisting(searchQuery);
-      if (isDuplicate(failure.content.what_failed, existing, 0.6)) {
-        hookLog('memory-stop', `[FailureDetector] Skipped duplicate: ${failure.signal}`);
-        continue;
-      }
-
-      const key = `hook_failure_${failure.signal}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`;
-      const memoryService = MemoryService.getInstance();
-
-      memoryService.store({
-        key,
-        value: {
-          title: `Avoid: ${failure.content.what_failed.substring(0, 50)}`,
-          description: failure.content.why_failed.substring(0, 100),
-          content: failure.content,
-        },
-        type: 'failure',
-        context: {
-          projectId: projectId,
-          timestamp: Date.now(),
-        },
-        relevanceScore: failure.confidence,
-      });
-
-      stored++;
-      hookLog('memory-stop', `[FailureDetector] Stored ${failure.signal}: ${failure.content.what_failed.substring(0, 80)}`);
-    }
-
-    hookLog('memory-stop', `[FailureDetector] Stored ${stored} failure(s) from ${failures.length} detected`);
-    return failures;
-  } catch (error) {
-    hookLog('memory-stop', `[FailureDetector] Error: ${error}`);
-    return [];
-  }
+  return storeDetectedFailures(readTranscriptTail(transcriptPath, 200));
 }
 
 /**
@@ -375,89 +308,6 @@ function getToolFailureEvents(outcomeStorage: OutcomeStorage, sessionId?: string
   }
 }
 
-/** lesson_kind values extractHindsightHint may legitimately return. */
-const VALID_LESSON_KINDS = new Set([
-  'rule', 'preference', 'anti_pattern', 'workflow', 'debug_fix', 'failure_preventer',
-]);
-
-/**
- * Generate candidate lessons from high-confidence failures.
- * Deduplicates against existing lessons and increments evidence count for similar ones.
- *
- * The lesson text must be failure-specific. Detectors emit a constant
- * what_should_do ("Check command syntax..."), so using it verbatim made every
- * unrelated failure "similar" to every other — evidence counts inflated across
- * unrelated failures and the promotion engine could only ever promote generic
- * boilerplate. Prefer an LLM hindsight hint; without one, ground the generic
- * remedy in what actually failed so similarity matching compares failures,
- * not the shared remedy string.
- */
-async function generateCandidateLessons(
-  failures: DetectedFailure[],
-  episodeId: string,
-  projectId: string,
-): Promise<void> {
-  try {
-    const outcomeStorage = OutcomeStorage.getInstance();
-    // Each hint is an LLM call (via the subscription CLI it can take seconds),
-    // and this loop runs INLINE in the Stop hook's ~40s budget — cap the LLM
-    // calls per run; failures past the cap keep the grounded generic lesson.
-    let hintBudget = 5;
-    for (const f of failures) {
-      if (f.confidence < 0.7) continue;
-
-      let lessonText = `${f.content.what_should_do} (failure: ${f.content.what_failed})`;
-      let lessonKind = 'failure_preventer';
-      let appliesWhen = extractTagsFromContext(f.content.context);
-
-      const hint = hintBudget-- > 0 ? await extractHindsightHint(
-        `${f.content.what_failed}${f.content.why_failed ? ` — ${f.content.why_failed}` : ''}`,
-        f.content.context || '',
-      ) : null;
-      if (hint) {
-        lessonText = hint.hint_text;
-        if (VALID_LESSON_KINDS.has(hint.hint_kind)) {
-          lessonKind = hint.hint_kind;
-        }
-        if (hint.applies_when.length > 0) {
-          appliesWhen = hint.applies_when;
-        }
-      }
-
-      const similar = outcomeStorage.findSimilarLessons(lessonText, projectId);
-      if (similar.length > 0) {
-        outcomeStorage.incrementEvidenceCount(similar[0].id);
-      } else {
-        outcomeStorage.createCandidateLesson({
-          project_id: projectId,
-          episode_id: episodeId,
-          lesson_text: lessonText,
-          lesson_kind: lessonKind,
-          applies_when: appliesWhen,
-          outcome_type: 'negative',
-          reward_band: -1,
-          confidence: f.confidence,
-          durability: 'project',
-        });
-      }
-    }
-  } catch (err) {
-    hookLog('memory-stop', `Candidate lesson generation error: ${safeErrorMessage(err)}`);
-  }
-}
-
-function extractTagsFromContext(context: string): string[] {
-  const tags: string[] = [];
-  const words = context.toLowerCase().split(/\s+/).filter(w => w.length >= 4);
-  // Take up to 5 significant words as tags
-  for (const w of words) {
-    if (tags.length >= 5) break;
-    if (!['that', 'this', 'with', 'from', 'were', 'been'].includes(w)) {
-      tags.push(w);
-    }
-  }
-  return tags;
-}
 
 /**
  * Convert raw JSONL transcript entries to ConversationEntry[] for session extraction.

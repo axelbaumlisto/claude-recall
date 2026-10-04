@@ -7,9 +7,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Fixed
-
 ## [Unreleased]
+
+### Fixed
 
 - **Retention is now enforced on every host, and on the tables that actually grow.** Compaction only ever ran from the MCP server's boot path, so a Pi-only machine never compacted at all: `maxMemories` printed `Memory usage at 240% (24030/10000)` on every store while the database kept growing (measured: 133MB, 24032 memories). Two gaps made that unbounded even where compaction did run — `failure`, the highest-volume automatic write (23532 of those rows), had no retention, and outcome telemetry (`outcome_events` at 246845 rows, about two thirds of the file) had none at all. Since failures are a rule type, every turn loaded them: 5059 rules / 3.05MB / 80.6ms per turn, against 14.6ms once capped. Pi's `session_start` now calls the same compaction the MCP boot path does, via a shared `compactIfDue()` **throttled to once a day per database** (`compactThreshold` is 10MB, so `shouldCompact()` is true for most working databases, and compaction copies a backup and VACUUMs — without a floor, a host opening a session a minute would pay that every minute). Maintenance never throws: it must not keep a session or a server from starting.
 
@@ -27,6 +27,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - **`CLAUDE_RECALL_OUTCOME_TRACKING`** (`auto` | `on` | `off`, default `auto`). `auto` collects where the distillation step runs; `on` forces collection everywhere, which is what you want when reading the `outcomes` CLI or debugging capture; `off` disables it entirely. Failure memories are unaffected — Pi reads those back as rules.
+
+### Added
+
+- **Pi hosts can use an LLM again — through Pi itself.** Capture classification, session learnings, checkpoint extraction and hindsight hints all need a model, and the backends were `claude -p`, `kiro-cli` and an opt-in Anthropic key. A Pi-only machine has none of those, so every one of those features was silently inert there. Pi ships the same affordance the other runtimes do — `pi -p` answers on the model the user already configured — so it needs no API key either. The nested call runs with `--no-extensions`, which is a stronger recursion guard than an environment flag: the child cannot load claude-recall at all. New: `CLAUDE_RECALL_PI_MODEL`, `CLAUDE_RECALL_PI_LLM_TIMEOUT_MS`.
+
+  The backend is gated on the Pi extension announcing the runtime, not on `pi` being on PATH — a Claude Code user who also has Pi installed must not have their hooks quietly answered by a different agent.
+
+- **Sessions distil their failures into lessons on every runtime, not only Claude Code.** The end-of-session pass — detect what went wrong, ask the model for the hindsight, record a candidate lesson, promote what has earned it — lived inside the Claude Code Stop hook. On a Pi host failures were therefore captured as rules and never distilled: `candidate_lessons` stayed empty while 808 "Command failed: …" memories accumulated and were loaded every turn. The pass now lives in `src/shared/session-distillation.ts` and runs from Pi's `session_shutdown` too.
+
+  Two runtime assumptions had to go. The failure detectors took transcript entries, which Pi does not have; they now accept the tool interactions a runtime already holds, and Claude Code keeps reconstructing them from its transcript. And the non-zero-exit detector matched only Claude Code's `Exit code 1`; Pi prints `Command exited with code 1`, so it recognised nothing. Both markers are now understood, and the shell tool is matched case-insensitively (`Bash` / `bash`).
+
+### Changed
+
+- **The three runtime CLI backends share one implementation** (`src/hooks/runtime-cli.ts`). `completeWithClaudeCli` and `completeWithKiroCli` were the same spawn, timeout, kill and stdout handling with different argv; adding a third copy for Pi would have made three.
 
 ## [0.43.0] - 2026-09-30
 
