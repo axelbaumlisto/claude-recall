@@ -436,6 +436,19 @@ describe('Pi Extension', () => {
       expect(mockIncrementCiteCount).not.toHaveBeenCalled();
     });
 
+    it('still records the citation when no rule was injected to match it', () => {
+      // A fresh session with nothing injected: nobody is credited, but the
+      // citation must not vanish — that is how we measure precision.
+      mockIncrementCiteCount.mockClear();
+
+      api._handlers['message_end'](
+        assistantSaying('Done (applied from memory: some rule we never supplied).'),
+        mockCtx(),
+      );
+
+      expect(mockIncrementCiteCount).not.toHaveBeenCalled();
+    });
+
     it('survives a malformed message rather than breaking the turn', () => {
       expect(() =>
         api._handlers['message_end']({ type: 'message_end' } as any, mockCtx()),

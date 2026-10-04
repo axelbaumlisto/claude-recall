@@ -175,10 +175,9 @@ export default function(pi: PiTypes.ExtensionAPI) {
       // not in the database — matched an unrelated llm_proxy note at
       // containment 1.0, purely because that note was long enough to contain
       // both words. Credit belongs to a rule we supplied, or to nobody.
-      if (injectedThisTurn.length === 0) return;
-
-      const ms = MemoryService.getInstance();
+      // No candidates means no credit, but the citation still gets logged below.
       const matches = matchCitations(citations, injectedThisTurn);
+      const ms = MemoryService.getInstance();
 
       for (const { key } of matches) {
         ms.incrementCiteCount(key);
