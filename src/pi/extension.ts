@@ -104,6 +104,13 @@ export default function(pi: PiTypes.ExtensionAPI) {
   // user who also has Pi installed would get their hooks answered by it.
   process.env.CLAUDE_RECALL_RUNTIME = 'pi';
 
+  // A nested session spawned by our own LLM backend must stay a plain Pi run:
+  // no capture, no distillation, no citations — otherwise asking the model why
+  // a command failed would itself become a session that asks why a command
+  // failed. The backend prefers `--no-extensions`, which makes this moot, but a
+  // host whose models come from an extension has to load them.
+  if (process.env.CLAUDE_RECALL_NESTED === '1') return;
+
   /** Longest a session may spend distilling before it is allowed to exit. */
   const DISTILLATION_DEADLINE_MS = 20000;
 
