@@ -50,7 +50,18 @@ export async function generateCandidateLessons(
     for (const f of failures) {
       if (f.confidence < 0.7) continue;
 
-      let lessonText = `${f.content.what_should_do} (failure: ${f.content.what_failed})`;
+      // The grounded text already names what failed, so a repeat of the same
+      // failure matches here — and then there is nothing to ask the model
+      // about. Hindsight was being bought before this check, so every repeat
+      // of a known failure paid for a call and threw the answer away.
+      const grounded = `${f.content.what_should_do} (failure: ${f.content.what_failed})`;
+      const known = outcomeStorage.findSimilarLessons(grounded, projectId);
+      if (known.length > 0) {
+        outcomeStorage.incrementEvidenceCount(known[0].id);
+        continue;
+      }
+
+      let lessonText = grounded;
       let lessonKind = 'failure_preventer';
       let appliesWhen = extractTagsFromContext(f.content.context);
 
