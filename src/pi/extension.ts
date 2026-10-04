@@ -13,6 +13,7 @@ import { OutcomeStorage } from '../services/outcome-storage';
 import { LoggingService } from '../services/logging';
 import { DatabaseManager } from '../services/database-manager';
 import { shouldRecordOutcomes } from '../shared/outcome-capture';
+import { CitableRule, extractCitations, matchCitations } from '../shared/citations';
 import {
   processToolOutcome,
   processUserInput,
@@ -103,6 +104,8 @@ export default function(pi: PiTypes.ExtensionAPI) {
   const sessionId: string = `pi_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
   const collectedToolResults: ConversationEntry[] = [];
   let rulesLoaded = false;
+  /** Rules injected into the current turn — the only candidates for its citations. */
+  let injectedThisTurn: CitableRule[] = [];
   const collectedUserTexts: string[] = [];
   // Chronologically interleaved entries (user input + tool results in order)
   // for auto-checkpoint extraction at session end. Distinct from the two
@@ -140,6 +143,60 @@ export default function(pi: PiTypes.ExtensionAPI) {
     // Fire-and-forget and self-throttling (once a day by default); failures are
     // swallowed by compactIfDue so a session never waits on maintenance.
     void DatabaseManager.getInstance().compactIfDue();
+  });
+
+  // --- Event: credit rules the model says it applied ---
+  //
+  // The rule directive Pi injects asks for `(applied from memory: …)` at the
+  // point of use, and models do write it — but only Claude Code's stop hook
+  // ever read those marks back, so under Pi every rule sat at cite_count 0 no
+  // matter how often it was applied. Demotion, the compliance report and the
+  // janitor all read that counter, so the whole quality side was blind here.
+  pi.on('message_end', (event, _ctx) => {
+    try {
+      const message = event?.message;
+      if (!message || message.role !== 'assistant') return;
+
+      const text = Array.isArray(message.content)
+        ? message.content
+            .filter((c): c is PiTypes.TextContent => c.type === 'text')
+            .map(c => c.text)
+            .join('\n')
+        : typeof message.content === 'string'
+          ? message.content
+          : '';
+
+      const citations = extractCitations(text);
+      if (citations.length === 0) return;
+
+      // Only the rules this turn actually injected are candidates. Scoring
+      // against the whole store looks more generous and is simply wrong: the
+      // citation "self-verify before done" — a rule that lives in AGENTS.md,
+      // not in the database — matched an unrelated llm_proxy note at
+      // containment 1.0, purely because that note was long enough to contain
+      // both words. Credit belongs to a rule we supplied, or to nobody.
+      if (injectedThisTurn.length === 0) return;
+
+      const ms = MemoryService.getInstance();
+      const matches = matchCitations(citations, injectedThisTurn);
+
+      for (const { key } of matches) {
+        ms.incrementCiteCount(key);
+        try {
+          OutcomeStorage.getInstance().recordHelpful(key);
+        } catch { /* best-effort — ignore */ }
+      }
+
+      if (matches.length > 0) {
+        LoggingService.getInstance().info(
+          'pi-extension',
+          `Credited ${matches.length} of ${citations.length} citation(s)`,
+          { keys: matches.map(m => m.key) },
+        );
+      }
+    } catch {
+      // Never let bookkeeping break a turn
+    }
   });
 
   // --- Event: inject rules before each agent turn (full load on first turn,
@@ -181,6 +238,7 @@ export default function(pi: PiTypes.ExtensionAPI) {
       const userPrompt: string = (_event as any)?.prompt ?? '';
       if (userPrompt && allRulesFlat.length > 0) {
         const matches = rankRulesForToolCall('agent_turn', { command: userPrompt }, allRulesFlat);
+        injectedThisTurn = matches.map(m => ({ key: m.rule.key, value: m.rule.value }));
         if (matches.length > 0) {
           const reminder = formatJitReminder(matches);
           systemPromptOut = (systemPromptOut ?? _event.systemPrompt) + '\n\n' + reminder;
