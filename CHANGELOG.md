@@ -13,6 +13,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
   The backend is gated on the Pi extension announcing the runtime, not on `pi` being on PATH — a Claude Code user who also has Pi installed must not have their hooks quietly answered by a different agent.
 
+- **Sessions distil their failures into lessons on every runtime, not only Claude Code.** The end-of-session pass — detect what went wrong, ask the model for the hindsight, record a candidate lesson, promote what has earned it — lived inside the Claude Code Stop hook. On a Pi host failures were therefore captured as rules and never distilled: `candidate_lessons` stayed empty while 808 "Command failed: …" memories accumulated and were loaded every turn. The pass now lives in `src/shared/session-distillation.ts` and runs from Pi's `session_shutdown` too.
+
+  Two runtime assumptions had to go. The failure detectors took transcript entries, which Pi does not have; they now accept the tool interactions a runtime already holds, and Claude Code keeps reconstructing them from its transcript. And the non-zero-exit detector matched only Claude Code's `Exit code 1`; Pi prints `Command exited with code 1`, so it recognised nothing. Both markers are now understood, and the shell tool is matched case-insensitively (`Bash` / `bash`).
+
 ### Changed
 
 - **The three runtime CLI backends share one implementation** (`src/hooks/runtime-cli.ts`). `completeWithClaudeCli` and `completeWithKiroCli` were the same spawn, timeout, kill and stdout handling with different argv; adding a third copy for Pi would have made three.
