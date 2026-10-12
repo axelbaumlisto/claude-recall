@@ -36,6 +36,10 @@ permissions:
 jobs:
   publish:
     name: Publish to npm (OIDC)
+    # Only the upstream repository owns this package name on npm. A fork tagging
+    # a soak build must not try to publish it — the attempt always fails and the
+    # red run hides whether the fork's own tests passed.
+    if: github.repository == 'raoulbia-ai/claude-recall'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
