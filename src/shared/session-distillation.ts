@@ -40,14 +40,27 @@ export async function generateCandidateLessons(
   failures: DetectedFailure[],
   episodeId: string,
   projectId: string,
+  /** Aborted when the caller has run out of time: no further failure is taken up. */
+  stop?: AbortSignal,
 ): Promise<void> {
   try {
     const outcomeStorage = OutcomeStorage.getInstance();
+
+    /** A lesson already on record gains evidence instead of a duplicate. */
+    const countedAsEvidence = (text: string): boolean => {
+      const [known] = outcomeStorage.findSimilarLessons(text, projectId);
+      if (known) outcomeStorage.incrementEvidenceCount(known.id);
+      return known !== undefined;
+    };
+
     // Each hint is an LLM call (via the subscription CLI it can take seconds),
     // and this loop runs INLINE in the Stop hook's ~40s budget — cap the LLM
     // calls per run; failures past the cap keep the grounded generic lesson.
     let hintBudget = 5;
     for (const f of failures) {
+      // Checked per failure, not per await: a call already in flight is paid
+      // for, so its answer is still recorded — but nothing new is started.
+      if (stop?.aborted) break;
       if (f.confidence < 0.7) continue;
 
       // The grounded text already names what failed, so a repeat of the same
@@ -55,11 +68,7 @@ export async function generateCandidateLessons(
       // about. Hindsight was being bought before this check, so every repeat
       // of a known failure paid for a call and threw the answer away.
       const grounded = `${f.content.what_should_do} (failure: ${f.content.what_failed})`;
-      const known = outcomeStorage.findSimilarLessons(grounded, projectId);
-      if (known.length > 0) {
-        outcomeStorage.incrementEvidenceCount(known[0].id);
-        continue;
-      }
+      if (countedAsEvidence(grounded)) continue;
 
       let lessonText = grounded;
       let lessonKind = 'failure_preventer';
@@ -79,22 +88,19 @@ export async function generateCandidateLessons(
         }
       }
 
-      const similar = outcomeStorage.findSimilarLessons(lessonText, projectId);
-      if (similar.length > 0) {
-        outcomeStorage.incrementEvidenceCount(similar[0].id);
-      } else {
-        outcomeStorage.createCandidateLesson({
-          project_id: projectId,
-          episode_id: episodeId,
-          lesson_text: lessonText,
-          lesson_kind: lessonKind,
-          applies_when: appliesWhen,
-          outcome_type: 'negative',
-          reward_band: -1,
-          confidence: f.confidence,
-          durability: 'project',
-        });
-      }
+      if (countedAsEvidence(lessonText)) continue;
+
+      outcomeStorage.createCandidateLesson({
+        project_id: projectId,
+        episode_id: episodeId,
+        lesson_text: lessonText,
+        lesson_kind: lessonKind,
+        applies_when: appliesWhen,
+        outcome_type: 'negative',
+        reward_band: -1,
+        confidence: f.confidence,
+        durability: 'project',
+      });
     }
   } catch (err) {
     hookLog(LOG_TAG, `Candidate lesson generation error: ${safeErrorMessage(err)}`);
@@ -190,9 +196,11 @@ export async function distilSession(input: {
   interactions?: ToolInteraction[];
   failures?: DetectedFailure[];
   /**
-   * Give up distilling after this long and still promote what is already
-   * stored. In-process runtimes keep the process alive until this resolves, so
-   * an unbounded pass delays the user's exit by one LLM call per failure.
+   * Stop distilling after this long and promote what is already stored.
+   * In-process runtimes keep the process alive while this works, so an
+   * unbounded pass delays the user's exit by one LLM call per failure. At the
+   * deadline no further failure is taken up; a call already in flight is left
+   * to finish, so the exit is late by at most that one call.
    */
   deadlineMs?: number;
 }): Promise<void> {
@@ -200,7 +208,8 @@ export async function distilSession(input: {
   const all = [...detected, ...(input.failures ?? [])];
 
   if (all.length > 0) {
-    const lessons = generateCandidateLessons(all, input.episodeId, input.projectId);
+    const stop = new AbortController();
+    const lessons = generateCandidateLessons(all, input.episodeId, input.projectId, stop.signal);
     if (input.deadlineMs === undefined) {
       await lessons;
     } else {
@@ -208,11 +217,12 @@ export async function distilSession(input: {
       const deadline = new Promise<void>((resolve) => {
         timer = setTimeout(() => {
           hookLog(LOG_TAG, `deadline reached after ${input.deadlineMs}ms — promoting what is stored`);
+          stop.abort();
           resolve();
         }, input.deadlineMs);
       });
       await Promise.race([lessons, deadline]);
-      if (timer) clearTimeout(timer);
+      clearTimeout(timer);
     }
   }
 
