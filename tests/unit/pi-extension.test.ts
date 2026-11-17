@@ -731,6 +731,9 @@ describe('Pi Extension', () => {
     }
 
     it('ends a session as one episode, promoted once, after its lessons exist', async () => {
+      mockExtractHindsightHint.mockResolvedValueOnce({
+        hint_text: 'check the target exists before building it', hint_kind: 'failure_preventer', applies_when: ['make'],
+      });
       const ctx = mockCtx('/home/user/test-project');
       api._handlers['session_start']({ type: 'session_start' }, ctx);
       api._handlers['tool_result'](toolResult(1, true), ctx);

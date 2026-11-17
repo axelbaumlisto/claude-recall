@@ -163,6 +163,51 @@ describe('session distillation', () => {
       expect(mockCreateLesson).not.toHaveBeenCalled();
     });
 
+    it('records no lesson that would only restate the failure', async () => {
+      // No hindsight, and the remedy is the detector's default: promoted, this
+      // would be a rule loaded every turn that says what the failure memory
+      // already says.
+      mockDetect.mockReturnValue([{
+        signal: 'non-zero-exit', confidence: 0.85,
+        content: {
+          what_failed: 'Command failed: terraform plan', why_failed: 'Exit code 1',
+          what_should_do: 'Check command syntax, file paths, and prerequisites before running', context: 'ctx',
+        },
+      }]);
+      mockHint.mockResolvedValue(null);
+
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
+
+      expect(mockCreateLesson).not.toHaveBeenCalled();
+      expect(mockIncrementEvidence).not.toHaveBeenCalled();
+    });
+
+    it('keeps the lesson when the model had hindsight to give, default remedy or not', async () => {
+      mockDetect.mockReturnValue([{
+        signal: 'non-zero-exit', confidence: 0.85,
+        content: {
+          what_failed: 'Command failed: terraform plan', why_failed: 'Exit code 1',
+          what_should_do: 'Check command syntax, file paths, and prerequisites before running', context: 'ctx',
+        },
+      }]);
+      mockHint.mockResolvedValue({ hint_text: 'run terraform init before plan', hint_kind: 'failure_preventer', applies_when: ['terraform'] });
+
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
+
+      expect(mockCreateLesson.mock.calls[0][0]).toMatchObject({ lesson_text: 'run terraform init before plan' });
+    });
+
+    it('keeps a lesson whose remedy a paired fix has already made specific', async () => {
+      // `failure()` carries a remedy of its own; no model is needed for that
+      // to be worth recording.
+      mockDetect.mockReturnValue([failure('npm test exited 1')]);
+      mockHint.mockResolvedValue(null);
+
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
+
+      expect(mockCreateLesson).toHaveBeenCalledTimes(1);
+    });
+
     it('learns from a failure even when its memory is already on record', async () => {
       // Under Pi every failure is captured as the tool fails, so by session end
       // each one is "already stored". That must not cost it its lesson.

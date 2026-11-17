@@ -12,6 +12,7 @@ import { ConfigService } from '../services/config';
 import { MemoryService } from '../services/memory';
 import { OutcomeStorage } from '../services/outcome-storage';
 import { PromotionEngine } from '../services/promotion-engine';
+import { BOILERPLATE_LESSONS } from '../services/memory-quality';
 import { extractHindsightHint } from '../hooks/llm-classifier';
 import { DetectedFailure, detectFailures, detectTranscriptFailures } from '../hooks/failure-detectors';
 import type { ToolInteraction } from '../hooks/shared';
@@ -40,8 +41,18 @@ export async function generateCandidateLessons(
   failures: DetectedFailure[],
   episodeId: string,
   projectId: string,
-  /** Aborted when the caller has run out of time: no further failure is taken up. */
-  stop?: AbortSignal,
+  opts: {
+    /** Aborted when the caller has run out of time: no further failure is taken up. */
+    stop?: AbortSignal;
+    /**
+     * Record no lesson for a failure the model had nothing to say about and
+     * whose remedy is still the detector's default. Such a lesson is the
+     * failure restated — "check prerequisites (failure: X)" — and once promoted
+     * it is a rule loaded every turn that says only what the failure memory
+     * already says. A remedy enriched by a paired fix is kept.
+     */
+    skipBoilerplate?: boolean;
+  } = {},
 ): Promise<void> {
   try {
     const outcomeStorage = OutcomeStorage.getInstance();
@@ -52,7 +63,7 @@ export async function generateCandidateLessons(
     for (const f of failures) {
       // Checked per failure, not per await: a call already in flight is paid
       // for, so its answer is still recorded — but nothing new is started.
-      if (stop?.aborted) break;
+      if (opts.stop?.aborted) break;
       if (f.confidence < 0.7) continue;
 
       let lessonText = `${f.content.what_should_do} (failure: ${f.content.what_failed})`;
@@ -63,6 +74,10 @@ export async function generateCandidateLessons(
         `${f.content.what_failed}${f.content.why_failed ? ` — ${f.content.why_failed}` : ''}`,
         f.content.context || '',
       ) : null;
+      if (!hint && opts.skipBoilerplate
+        && BOILERPLATE_LESSONS.has(f.content.what_should_do.trim().toLowerCase())) {
+        continue;
+      }
       if (hint) {
         lessonText = hint.hint_text;
         if (VALID_LESSON_KINDS.has(hint.hint_kind)) {
@@ -237,7 +252,12 @@ export async function distilSession(input: {
 
   if (failures.length > 0) {
     const stop = new AbortController();
-    const lessons = generateCandidateLessons(failures, input.episodeId, input.projectId, stop.signal);
+    const lessons = generateCandidateLessons(failures, input.episodeId, input.projectId, {
+      stop: stop.signal,
+      // Without a model there is often nothing here but the detector's default
+      // remedy, and on a Pi host that is the usual case, not the exception.
+      skipBoilerplate: true,
+    });
     if (input.deadlineMs === undefined) {
       await lessons;
     } else {
