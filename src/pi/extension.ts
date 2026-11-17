@@ -114,13 +114,14 @@ export default function(pi: PiTypes.ExtensionAPI) {
   // announcePiHost().
   announcePiHost();
 
-  /** Longest a session may spend distilling before it is allowed to exit. */
-  const DISTILLATION_DEADLINE_MS = 20000;
   /**
-   * Longest quitting may be held up by everything a session owes at its end.
-   * A backstop: each piece is bounded on its own, and with no model to ask the
-   * whole of it takes milliseconds.
+   * Two points on one clock that starts when the session ends. Distillation
+   * stops taking up failures at the first, which leaves a model call already
+   * in flight (capped at 10s) and the promotion that follows room to finish
+   * before the second — where quitting stops waiting, whatever is left. With
+   * no model to ask, all of it takes milliseconds.
    */
+  const DISTILLATION_STOPS_AFTER_MS = 15000;
   const SESSION_END_BUDGET_MS = 30000;
 
   let projectId: string = '';
@@ -383,8 +384,10 @@ export default function(pi: PiTypes.ExtensionAPI) {
     // The session's failures are distilled into lessons here too. Until now
     // that ran only from Claude Code's Stop hook, so on a Pi host failures
     // accumulated as rules and never became lessons.
+    // A copy: the buffer belongs to the session, and this outlives it when the
+    // session is replaced rather than ended.
     const distil = projectId
-      ? { interactions: toolInteractions, deadlineMs: DISTILLATION_DEADLINE_MS }
+      ? { interactions: [...toolInteractions], stopAt: Date.now() + DISTILLATION_STOPS_AFTER_MS }
       : {};
     work.push(processSessionEnd(collectedUserTexts, sessionId, projectId, undefined, distil).then(result => {
       if (result.stored > 0) notify(`📝 Recall: captured ${result.stored} memories from this session`);

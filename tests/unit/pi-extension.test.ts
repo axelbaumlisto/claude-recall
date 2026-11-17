@@ -801,6 +801,24 @@ describe('Pi Extension', () => {
       }
     });
 
+    it('distils the session that ended, not whatever its buffer holds by then', async () => {
+      // When a session is replaced the work is left to finish behind the new
+      // one, and the new one starts by emptying the buffers.
+      const detect = jest.spyOn(require('../../src/hooks/failure-detectors'), 'detectFailures');
+      const ctx = mockCtx('/home/user/test-project');
+      api._handlers['session_start']({ type: 'session_start' }, ctx);
+      api._handlers['tool_result'](toolResult(1, true), ctx);
+      api._handlers['tool_result'](toolResult(2, false), ctx);
+
+      await api._handlers['session_shutdown']({ type: 'session_shutdown', reason: 'new' }, ctx);
+      api._handlers['session_start']({ type: 'session_start' }, ctx);
+      await flush();
+
+      expect(detect).toHaveBeenCalledTimes(1);
+      expect((detect.mock.calls[0][0] as unknown[]).length).toBe(2);
+      detect.mockRestore();
+    });
+
     it('keeps every buffered tool call distinguishable in a long session', async () => {
       const detect = jest.spyOn(require('../../src/hooks/failure-detectors'), 'detectFailures');
       const ctx = mockCtx('/home/user/test-project');
