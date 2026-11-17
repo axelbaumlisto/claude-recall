@@ -13,7 +13,6 @@ import { OutcomeStorage } from '../services/outcome-storage';
 import { LoggingService } from '../services/logging';
 import { DatabaseManager } from '../services/database-manager';
 import { shouldRecordOutcomes } from '../shared/outcome-capture';
-import type { ToolInteraction as PiToolInteraction } from '../hooks/shared';
 import {
   processToolOutcome,
   processUserInput,
@@ -26,6 +25,7 @@ import {
   ConversationEntry,
 } from '../shared/event-processors';
 import { rankRulesForToolCall, Rule, RankedRule } from '../services/rule-retrieval';
+import type { ToolInteraction as PiToolInteraction } from '../hooks/shared';
 import { CitableRule, extractCitations, matchCitations } from '../shared/citations';
 import { announcePiHost } from '../hooks/pi-classifier';
 // Shared audited directive — memories are advisory user preferences, never
@@ -114,26 +114,9 @@ export default function(pi: PiTypes.ExtensionAPI) {
   // announcePiHost().
   announcePiHost();
 
-  /** Longest a session may spend distilling before it is allowed to exit. */
-  const DISTILLATION_DEADLINE_MS = 20000;
-  /**
-   * Longest quitting may be held up by everything a session owes at its end.
-   * A backstop: each piece is bounded on its own, and with no model to ask the
-   * whole of it takes milliseconds.
-   */
-  const SESSION_END_BUDGET_MS = 30000;
-
   let projectId: string = '';
   const sessionId: string = `pi_${Date.now()}_${Math.random().toString(36).substr(2, 6)}`;
   const collectedToolResults: ConversationEntry[] = [];
-  /** Tool calls and their outcomes, in the shape the failure detectors want. */
-  const toolInteractions: PiToolInteraction[] = [];
-  /**
-   * Position of a tool call in the session. The detectors tell calls apart by
-   * it, so it has to keep counting when the buffer below starts dropping its
-   * oldest entries — the buffer's length stops moving at the cap.
-   */
-  let toolCallSeq = 0;
   let rulesLoaded = false;
   /** Rules injected into the current turn — the only candidates for its citations. */
   let injectedThisTurn: CitableRule[] = [];
@@ -144,6 +127,24 @@ export default function(pi: PiTypes.ExtensionAPI) {
   // and extractSessionLearnings.
   const collectedEntries: ConversationEntry[] = [];
   const MAX_COLLECTED_ENTRIES = 100;
+  /**
+   * Two points on one clock that starts when the session ends. Distillation
+   * stops taking up failures at the first, which leaves a model call already
+   * in flight (capped at 10s) and the promotion that follows room to finish
+   * before the second — where quitting stops waiting, whatever is left. With
+   * no model to ask, all of it takes milliseconds.
+   */
+  const DISTILLATION_STOPS_AFTER_MS = 15000;
+  const SESSION_END_BUDGET_MS = 30000;
+
+  /** Tool calls and their outcomes, in the shape the failure detectors want. */
+  const toolInteractions: PiToolInteraction[] = [];
+  /**
+   * Position of a tool call in the session. The detectors tell calls apart by
+   * it, so it has to keep counting when the buffer below starts dropping its
+   * oldest entries — the buffer's length stops moving at the cap.
+   */
+  let toolCallSeq = 0;
 
   // Route logs through Pi's UI when available
   setLogFunction((source, msg) => {
@@ -314,7 +315,6 @@ export default function(pi: PiTypes.ExtensionAPI) {
 
     const result = processToolOutcome(event.toolName, event.input, output, event.isError, sessionId, 'pi');
 
-    // Collect for session extraction
     const entryIndex = toolCallSeq++;
     toolInteractions.push({
       call: { id: event.toolCallId, name: event.toolName, input: event.input, entryIndex },
@@ -322,6 +322,7 @@ export default function(pi: PiTypes.ExtensionAPI) {
     });
     if (toolInteractions.length > MAX_COLLECTED_ENTRIES) toolInteractions.shift();
 
+    // Collect for session extraction
     collectedToolResults.push({
       role: 'tool_result',
       text: output.substring(0, 300),
@@ -373,22 +374,28 @@ export default function(pi: PiTypes.ExtensionAPI) {
   // --- Event: session end — episode + promotion + session extraction ---
 
   pi.on('session_shutdown', async (event, ctx) => {
-    const notify = (message: string): void => {
-      if (!ctx.hasUI) return;
-      try { ctx.ui.notify(message, 'info'); } catch { /* non-critical */ }
-    };
-    /** Everything this session still owes the store. None of it may throw. */
+    /** Everything this session still owes the store. Each piece settles on its own. */
     const work: Promise<void>[] = [];
 
     // The session's failures are distilled into lessons here too. Until now
     // that ran only from Claude Code's Stop hook, so on a Pi host failures
-    // accumulated as rules and never became lessons.
+    // accumulated as rules and never became lessons. The calls are passed as a
+    // copy: the buffer belongs to the session, and this work outlives it when
+    // the session is replaced rather than ended.
     const distil = projectId
-      ? { interactions: toolInteractions, deadlineMs: DISTILLATION_DEADLINE_MS }
+      ? { interactions: [...toolInteractions], stopAt: Date.now() + DISTILLATION_STOPS_AFTER_MS }
       : {};
     work.push(processSessionEnd(collectedUserTexts, sessionId, projectId, undefined, distil).then(result => {
-      if (result.stored > 0) notify(`📝 Recall: captured ${result.stored} memories from this session`);
-      if (result.promoted > 0) notify(`⬆️ Recall: ${result.promoted} lesson(s) promoted to active rules`);
+      if (ctx.hasUI) {
+        try {
+          if (result.stored > 0) {
+            ctx.ui.notify(`📝 Recall: captured ${result.stored} memories from this session`, 'info');
+          }
+          if (result.promoted > 0) {
+            ctx.ui.notify(`⬆️ Recall: ${result.promoted} lesson(s) promoted to active rules`, 'info');
+          }
+        } catch { /* non-critical */ }
+      }
     }).catch(() => {}));
 
     // Session extraction: learn from long coding sessions
@@ -398,7 +405,9 @@ export default function(pi: PiTypes.ExtensionAPI) {
     ];
     if (allEntries.length >= 10) {
       work.push(extractSessionLearnings(allEntries, sessionId, projectId, 5).then(extracted => {
-        if (extracted > 0) notify(`🔍 Recall: extracted ${extracted} learnings from session`);
+        if (extracted > 0 && ctx.hasUI) {
+          try { ctx.ui.notify(`🔍 Recall: extracted ${extracted} learnings from session`, 'info'); } catch { /* non-critical */ }
+        }
       }).catch(() => {}));
     }
 
@@ -409,15 +418,19 @@ export default function(pi: PiTypes.ExtensionAPI) {
     // most-recent task, not user texts followed by all tool results.
     if (collectedEntries.length >= 3 && projectId) {
       work.push(extractCheckpoint(collectedEntries, projectId, 'pi').then(saved => {
-        if (saved) notify('📌 Recall: saved task checkpoint for next session');
+        if (saved && ctx.hasUI) {
+          try {
+            ctx.ui.notify('📌 Recall: saved task checkpoint for next session', 'info');
+          } catch { /* non-critical */ }
+        }
       }).catch(() => {}));
     }
 
     // Pi awaits this handler and then exits the process, so on quit anything
-    // left running is cut off mid-flight — the episode is opened and never
-    // closed, nothing is promoted, no checkpoint is written. When the session
-    // is only being replaced the process lives on, and the work is left to
-    // finish behind the new session rather than hold it up.
+    // still running is cut off at its next await: the episode is opened and
+    // never closed, nothing is promoted or pruned, no checkpoint is written.
+    // When the session is only being replaced the process lives on, and the
+    // work is left to finish behind the new session rather than hold it up.
     if (event?.reason === undefined || event.reason === 'quit') {
       let timer: NodeJS.Timeout | undefined;
       const budget = new Promise<void>(resolve => { timer = setTimeout(resolve, SESSION_END_BUDGET_MS); });

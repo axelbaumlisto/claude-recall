@@ -312,8 +312,8 @@ export async function processSessionEnd(
   sessionId: string,
   projectId: string,
   maxStore: number = 3,
-  /** What the session did, when the runtime kept it: its failures become lessons. */
-  work: { interactions?: ToolInteraction[]; deadlineMs?: number } = {},
+  /** The session's tool calls, when the runtime kept them: its failures become lessons. */
+  work: { interactions?: ToolInteraction[]; stopAt?: number } = {},
 ): Promise<{ stored: number; promoted: number }> {
   let stored = 0;
   let promoted = 0;
@@ -357,12 +357,17 @@ export async function processSessionEnd(
       outcome_summary: `Session end: ${stored} memories captured`,
     });
 
-    // Distil what the session did into candidate lessons, then promote —
-    // under this session's own episode, and once. With nothing to distil this
-    // is the promotion cycle alone, as before.
+    // Distil the session's failures into candidate lessons first, so that the
+    // promotion cycle below can act on what this session taught.
+    if (work.interactions?.length) {
+      const { distilFailures } = await import('./session-distillation');
+      await distilFailures({ interactions: work.interactions, projectId, episodeId, stopAt: work.stopAt });
+    }
+
+    // Run promotion cycle
     try {
-      const { distilSession } = await import('./session-distillation');
-      const result = await distilSession({ projectId, episodeId, ...work });
+      const { PromotionEngine } = await import('../services/promotion-engine');
+      const result = PromotionEngine.getInstance().runCycle(projectId);
       promoted = result.promoted;
     } catch {
       // Non-critical
