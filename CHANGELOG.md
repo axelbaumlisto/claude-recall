@@ -30,6 +30,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 - **`CLAUDE_RECALL_OUTCOME_TRACKING`** (`auto` | `on` | `off`, default `auto`). `auto` collects where the distillation step runs; `on` forces collection everywhere, which is what you want when reading the `outcomes` CLI or debugging capture; `off` disables it entirely. Failure memories are unaffected — Pi reads those back as rules. Every writer of these two tables consults the same policy — the Pi extension, Claude Code's `tool-outcome-watcher` and its `rule-injector` — so `off` is off on every runtime, not only where the default would already have stopped collecting.
 
+- **Citations are credited under Pi, not only under Claude Code.** The rule directive asks the model to mark the point of use — `(applied from memory: …)` — and models comply: a Pi-only transcript corpus here carries 30522 such marks across 2809 distinct phrasings. Only the Claude Code stop hook ever read them back, so under Pi every rule sat at `cite_count` 0 (measured: 1098 active rules, 123068 loads, zero citations) and everything downstream was blind — `rules demote` judges "loaded often, never cited", the compliance report reports nothing, and the janitor has no usage signal. A `message_end` handler now credits the cited rule.
+
+  Attribution is deliberately narrow, because a wrong credit is worse than none: it would feed demotion a counter built from noise. Candidates are the rules that turn injected, not the whole store — scored against everything, the citation "self-verify before done" (a rule living in AGENTS.md, never in the database) matched an unrelated note at containment 1.0 simply because the note was long enough to contain both words. Scoring also drops everyday words, needs two distinctive tokens, demands a complete match below four of them, and requires the winner to beat the runner-up by a margin.
+
+### Added
+
+- **`src/shared/citations.ts`** — citation scanning written for Pi's narrow attribution: a margin over the runner-up, a stopword list and a token floor on top of containment. The Claude Code stop hook keeps its own matching for now — it scores citations against the whole store rather than one turn's injected rules, where near-duplicates are common and a margin test would drop credits that count today. Moving it over is a separate change, with transcript numbers behind it.
+
 ## [0.47.0] - 2026-11-11
 
 ### Changed
