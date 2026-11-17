@@ -1,18 +1,12 @@
 /**
  * Whether raw outcome telemetry is worth collecting on this runtime.
  *
- * `outcome_events` and `rule_injection_events` are append-only observations —
- * one row per tool result — written so that the distillation step can later
- * turn them into `candidate_lessons` and citation counts. That step is
- * `memory-stop-hook`, wired only into Claude Code's hook CLI.
+ * `outcome_events` and `rule_injection_events` exist to feed `memory-stop-hook`,
+ * which is wired into Claude Code's hook CLI only. Elsewhere the rows are
+ * written and never read — on one Pi-only host, two thirds of the database.
  *
- * On a runtime without it the rows are written and never read, which is not
- * free: on one Pi-only host `outcome_events` reached 246845 rows and about two
- * thirds of a 133MB database, and `candidate_lessons` was still empty.
- *
- * So collection follows the consumer. `CLAUDE_RECALL_OUTCOME_TRACKING=on`
- * forces collection anyway (the `outcomes` CLI reads these tables, and raw
- * events are useful when debugging capture), `off` disables it everywhere.
+ * `CLAUDE_RECALL_OUTCOME_TRACKING=on` collects anyway (the `outcomes` CLI reads
+ * these tables), `off` collects nowhere.
  */
 export type Runtime = 'pi' | 'cc';
 

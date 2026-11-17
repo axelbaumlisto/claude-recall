@@ -127,11 +127,7 @@ export function processToolOutcome(
   toolOutput: string,
   isError: boolean,
   sessionId: string,
-  /**
-   * Which runtime is reporting. Decides whether the raw outcome event is worth
-   * storing — see shouldRecordOutcomes. Defaults to 'cc', the historical
-   * behaviour, so existing callers keep recording.
-   */
+  /** Reporting runtime; 'cc' keeps the historical behaviour for existing callers. */
   runtime: Runtime = 'cc',
 ): ToolOutcomeResult {
   const result: ToolOutcomeResult = { captured: false, fixPaired: false };

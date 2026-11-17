@@ -15,32 +15,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ### Added
 
-- **`CLAUDE_RECALL_RETAIN_FAILURES`** (default `1000`) and **`CLAUDE_RECALL_RETAIN_TELEMETRY_DAYS`** (default `30`); `-1` keeps all. Failures are capped by strength like tool-use and corrections; telemetry is pruned by age, since a month-old tool result teaches nothing. Episodes are dropped only once no event references them — `episode_id` carries no foreign key, so SQLite would otherwise orphan the live events of a long-running episode.
+- **`CLAUDE_RECALL_RETAIN_FAILURES`** (default `1000`) and **`CLAUDE_RECALL_RETAIN_TELEMETRY_DAYS`** (default `30`); `-1` keeps all. Failures are capped by strength like tool-use and corrections; telemetry is pruned by age, since a month-old tool result teaches nothing. Episodes are dropped only once nothing references them — neither an outcome event nor a candidate lesson — because `episode_id` carries no foreign key, so SQLite would otherwise orphan the rows of a long-running episode.
 
 ### Changed
 
 - **`pruneOldToolUse` and `pruneOldCorrections` collapsed into `pruneByType`** — they were the same function with a different type literal, and failures want the same policy.
+- **The failure cap never deletes a confirmed rule or a promoted lesson, and takes inactive rows first.** Promotions are stored as type `failure`, so a cap on raw capture could spend a lesson earned over several sessions to make room for the next `Command failed:` line — and `DELETE` has no undo. Rows with `confirmed_at` set, rows named `promoted_*` and rows a candidate lesson points at are now out of the cap's reach; what the cap does take, it takes from inactive (superseded or demoted) rows before touching anything a retrieval can still return.
+- **One telemetry cleanup, not two.** `OutcomeStorage.pruneOldData()` already dropped the same tables on a hard-coded 90-day clock, so a second pass inside compaction would have left the database with two windows. The age limit and the unreferenced-episode rule now live in `pruneOutcomeData()`, which both the hook path and `compact()` call on their own connection.
 - **`getCompactionConfig` merges the stored config over the defaults** instead of replacing them. A config file written before this change has a `compaction` block without the new retention keys, and an undefined cap would reach `scored.slice(keepCount)` and select every row for deletion.
 
 - **Raw outcome telemetry is no longer collected on runtimes that cannot consume it.** `outcome_events` and `rule_injection_events` are written one row per tool result so that `memory-stop-hook` can later distill them into `candidate_lessons` and citation counts — but that hook is wired into Claude Code's hook CLI only. Under Pi the rows were therefore written and never read: one host reached **246845 `outcome_events` rows, about two thirds of a 133MB database, with `candidate_lessons` still empty and every `cite_count` at zero**. `rule_injection_events` is worse off still — `getInjectionStats`, its only reader, has no callers on any runtime. Collection now follows the consumer, via one pure policy function (`shouldRecordOutcomes`) that both writers consult.
 
 ### Added
 
-- **`CLAUDE_RECALL_OUTCOME_TRACKING`** (`auto` | `on` | `off`, default `auto`). `auto` collects where the distillation step runs; `on` forces collection everywhere, which is what you want when reading the `outcomes` CLI or debugging capture; `off` disables it entirely. Failure memories are unaffected — Pi reads those back as rules.
+- **`CLAUDE_RECALL_OUTCOME_TRACKING`** (`auto` | `on` | `off`, default `auto`). `auto` collects where the distillation step runs; `on` forces collection everywhere, which is what you want when reading the `outcomes` CLI or debugging capture; `off` disables it entirely. Failure memories are unaffected — Pi reads those back as rules. Every writer of these two tables consults the same policy — the Pi extension, Claude Code's `tool-outcome-watcher` and its `rule-injector` — so `off` is off on every runtime, not only where the default would already have stopped collecting.
+
+- **Citations are credited under Pi, not only under Claude Code.** The rule directive asks the model to mark the point of use — `(applied from memory: …)` — and models comply: a Pi-only transcript corpus here carries 30522 such marks across 2809 distinct phrasings. Only the Claude Code stop hook ever read them back, so under Pi every rule sat at `cite_count` 0 (measured: 1098 active rules, 123068 loads, zero citations) and everything downstream was blind — `rules demote` judges "loaded often, never cited", the compliance report reports nothing, and the janitor has no usage signal. A `message_end` handler now credits the cited rule.
+
+  Attribution is deliberately narrow, because a wrong credit is worse than none: it would feed demotion a counter built from noise. Candidates are the rules that turn injected, not the whole store — scored against everything, the citation "self-verify before done" (a rule living in AGENTS.md, never in the database) matched an unrelated note at containment 1.0 simply because the note was long enough to contain both words. Scoring also drops everyday words, needs two distinctive tokens, demands a complete match below four of them, and requires the winner to beat the runner-up by a margin.
 
 ### Added
 
-- **Pi hosts can use an LLM again — through Pi itself.** Capture classification, session learnings, checkpoint extraction and hindsight hints all need a model, and the backends were `claude -p`, `kiro-cli` and an opt-in Anthropic key. A Pi-only machine has none of those, so every one of those features was silently inert there. Pi ships the same affordance the other runtimes do — `pi -p` answers on the model the user already configured — so it needs no API key either. The nested call runs with `--no-extensions`, which is a stronger recursion guard than an environment flag: the child cannot load claude-recall at all. New: `CLAUDE_RECALL_PI_MODEL`, `CLAUDE_RECALL_PI_LLM_TIMEOUT_MS`.
-
-  The backend is gated on the Pi extension announcing the runtime, not on `pi` being on PATH — a Claude Code user who also has Pi installed must not have their hooks quietly answered by a different agent.
-
-- **Sessions distil their failures into lessons on every runtime, not only Claude Code.** The end-of-session pass — detect what went wrong, ask the model for the hindsight, record a candidate lesson, promote what has earned it — lived inside the Claude Code Stop hook. On a Pi host failures were therefore captured as rules and never distilled: `candidate_lessons` stayed empty while 808 "Command failed: …" memories accumulated and were loaded every turn. The pass now lives in `src/shared/session-distillation.ts` and runs from Pi's `session_shutdown` too.
-
-  Two runtime assumptions had to go. The failure detectors took transcript entries, which Pi does not have; they now accept the tool interactions a runtime already holds, and Claude Code keeps reconstructing them from its transcript. And the non-zero-exit detector matched only Claude Code's `Exit code 1`; Pi prints `Command exited with code 1`, so it recognised nothing. Both markers are now understood, and the shell tool is matched case-insensitively (`Bash` / `bash`).
-
-### Changed
-
-- **The three runtime CLI backends share one implementation** (`src/hooks/runtime-cli.ts`). `completeWithClaudeCli` and `completeWithKiroCli` were the same spawn, timeout, kill and stdout handling with different argv; adding a third copy for Pi would have made three.
+- **`src/shared/citations.ts`** — citation scanning written for Pi's narrow attribution: a margin over the runner-up, a stopword list and a token floor on top of containment. The Claude Code stop hook keeps its own matching for now — it scores citations against the whole store rather than one turn's injected rules, where near-duplicates are common and a margin test would drop credits that count today. Moving it over is a separate change, with transcript numbers behind it.
 
 ## [0.47.0] - 2026-11-11
 
@@ -96,6 +92,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **Benign non-zero exits are no longer captured as "failures" — the biggest source of capture noise.** The watcher treated *any* non-zero Bash exit as a failure, but a large family of Unix tools use non-zero as a normal query answer: `git config --get x` exits 1 when the key is simply **unset**, `grep`/`rg` exit 1 on **no match**, `test`/`[` on **false**, `diff`/`cmp` on **differs**, `git diff --quiet` when there **are** changes, plus `pgrep`/`pidof`/`jq -e`. These are now recognised as benign (exit 1 only — `grep`'s exit 2 is still a real error), including when they end a pipeline (`… | grep x`). Transient network/timeout exits (`curl` 6/7/28/35, `wget` 4, `timeout` 124/137) are likewise not durable lessons. Also closed an own-goal: the low-output skip **exempted `git`**, so an output-less `git config --get` was captured *because* it started with `git` — real git failures always print to stderr, so the exemption is gone. Reported from the field: a project showed three "rules" that were all noise of exactly this kind.
 - **Auto-captured failures are no longer labelled "rules".** The statusline counted preferences + corrections + devops + solutions **+ failures** and called the total "rules", so a user who had taught it nothing could still see `🧠 Recall · 3 rules`. It now reports them separately — `🧠 Recall · 2 rules · 3 failures` — and omits the failure segment when there are none. The session-start banner counts consistently.
 - **The surfaces can no longer contradict each other.** `memory-sync` already refused to sync boilerplate-only failures into `MEMORY.md`, but `loadActiveRules` had no such filter — so the same memories were injected, counted and advertised as "rules" while the file index said "No recall rules synced". That predicate now lives in `services/memory-quality.ts` and is applied by **both**, so injection, `load_rules`, the statusline and the file index agree. Boilerplate failures are no longer injected at all (they cost context and teach nothing); the underlying failure still lives in the DB, so fix-pairing and evidence counting are unaffected, and a lesson enriched by a real fix becomes active again.
+
+### Added
+
+- **Pi hosts can use an LLM again — through Pi itself.** Capture classification, session learnings, checkpoint extraction and hindsight hints all need a model, and the backends were `claude -p`, `kiro-cli` and an opt-in Anthropic key. A Pi-only machine has none of those, so every one of those features was silently inert there. Pi ships the same affordance the other runtimes do — `pi -p` answers on the model the user already configured — so it needs no API key either. The nested call runs with `--no-extensions`, which is a stronger recursion guard than an environment flag: the child cannot load claude-recall at all. New: `CLAUDE_RECALL_PI_MODEL`, `CLAUDE_RECALL_PI_LLM_TIMEOUT_MS`.
+
+  The backend is gated on the Pi extension announcing the runtime, not on `pi` being on PATH — a Claude Code user who also has Pi installed must not have their hooks quietly answered by a different agent.
+
+- **Sessions distil their failures into lessons on every runtime, not only Claude Code.** The end-of-session pass — detect what went wrong, ask the model for the hindsight, record a candidate lesson, promote what has earned it — lived inside the Claude Code Stop hook. On a Pi host failures were therefore captured as rules and never distilled: `candidate_lessons` stayed empty while 808 "Command failed: …" memories accumulated and were loaded every turn. The pass now lives in `src/shared/session-distillation.ts` and runs from Pi's `session_shutdown` too.
+
+  Two runtime assumptions had to go. The failure detectors took transcript entries, which Pi does not have; they now accept the tool interactions a runtime already holds, and Claude Code keeps reconstructing them from its transcript. And the non-zero-exit detector matched only Claude Code's `Exit code 1`; Pi prints `Command exited with code 1`, so it recognised nothing. Both markers are now understood, and the shell tool is matched case-insensitively (`Bash` / `bash`).
+
+### Changed
+
+- **The three runtime CLI backends share one implementation** (`src/hooks/runtime-cli.ts`). `completeWithClaudeCli` and `completeWithKiroCli` were the same spawn, timeout, kill and stdout handling with different argv; adding a third copy for Pi would have made three.
+
 
 ## [0.43.0] - 2026-09-30
 

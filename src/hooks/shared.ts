@@ -249,6 +249,20 @@ export function isDuplicate(
 }
 
 /**
+ * Source of a memory captured from a Claude Code hook: its session and
+ * transcript, the transcript entry's uuid when the capture came from one, and
+ * the user's text (which outlives the transcript).
+ */
+export function hookSource(input: any, entry?: any, excerpt?: string): MemorySource {
+  return {
+    session: input?.session_id,
+    transcript: input?.transcript_path,
+    entry: entry?.uuid,
+    excerpt,
+  };
+}
+
+/**
  * The part of a stored memory worth comparing.
  *
  * Comparing against `JSON.stringify(value)` drowned the text in field names
@@ -266,20 +280,6 @@ export function comparableText(value: unknown): string {
     .filter((x): x is string => typeof x === 'string');
 
   return parts.length > 0 ? parts.join(' ') : JSON.stringify(value);
-}
-
-/**
- * Source of a memory captured from a Claude Code hook: its session and
- * transcript, the transcript entry's uuid when the capture came from one, and
- * the user's text (which outlives the transcript).
- */
-export function hookSource(input: any, entry?: any, excerpt?: string): MemorySource {
-  return {
-    session: input?.session_id,
-    transcript: input?.transcript_path,
-    entry: entry?.uuid,
-    excerpt,
-  };
 }
 
 /**

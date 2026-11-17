@@ -156,22 +156,16 @@ export default function(pi: PiTypes.ExtensionAPI) {
       // Non-critical
     }
 
-    // Enforce the documented retention limits here too. Until now the only
-    // caller was the MCP server's boot path, so on a Pi-only host nothing ever
-    // compacted: `maxMemories` just produced a warning while the store kept
-    // growing, and every turn paid for the larger rule corpus it had to load.
-    // Fire-and-forget and self-throttling (once a day by default); failures are
-    // swallowed by compactIfDue so a session never waits on maintenance.
+    // Until now only the MCP server's boot path compacted, so a Pi-only host
+    // never did. Fire-and-forget: compactIfDue throttles and swallows failures.
     void DatabaseManager.getInstance().compactIfDue();
   });
 
   // --- Event: credit rules the model says it applied ---
   //
-  // The rule directive Pi injects asks for `(applied from memory: …)` at the
-  // point of use, and models do write it — but only Claude Code's stop hook
-  // ever read those marks back, so under Pi every rule sat at cite_count 0 no
-  // matter how often it was applied. Demotion, the compliance report and the
-  // janitor all read that counter, so the whole quality side was blind here.
+  // Only Claude Code's stop hook read these marks back, so under Pi every rule
+  // sat at cite_count 0 however often it was applied — blinding demotion, the
+  // compliance report and the janitor.
   pi.on('message_end', (event, _ctx) => {
     try {
       const message = event?.message;
@@ -189,12 +183,10 @@ export default function(pi: PiTypes.ExtensionAPI) {
       const citations = extractCitations(text);
       if (citations.length === 0) return;
 
-      // Only the rules this turn actually injected are candidates. Scoring
-      // against the whole store looks more generous and is simply wrong: the
-      // citation "self-verify before done" — a rule that lives in AGENTS.md,
-      // not in the database — matched an unrelated llm_proxy note at
-      // containment 1.0, purely because that note was long enough to contain
-      // both words. Credit belongs to a rule we supplied, or to nobody.
+      // Candidates are the rules this turn injected. Scored against the whole
+      // store, "self-verify before done" — a rule living in AGENTS.md, not the
+      // database — matched an unrelated note at containment 1.0 just because it
+      // was long enough to contain both words.
       // No candidates means no credit, but the citation still gets logged below.
       const matches = matchCitations(citations, injectedThisTurn);
       const ms = MemoryService.getInstance();
@@ -227,6 +219,11 @@ export default function(pi: PiTypes.ExtensionAPI) {
   //     current prompt — Pi's analog of CC's PreToolUse rule injector) ---
 
   pi.on('before_agent_start', (_event, _ctx) => {
+    // A turn only credits the rules injected into that turn. Clearing here,
+    // not in the JIT branch below, is what makes that true: a turn with no
+    // prompt or no rules to match would otherwise keep the previous turn's
+    // candidates and credit them for text they never reached.
+    injectedThisTurn = [];
     try {
       const ms = MemoryService.getInstance();
       const rules = ms.loadActiveRules(projectId || undefined);
@@ -266,11 +263,8 @@ export default function(pi: PiTypes.ExtensionAPI) {
           const reminder = formatJitReminder(matches);
           systemPromptOut = (systemPromptOut ?? _event.systemPrompt) + '\n\n' + reminder;
 
-          // Record each injection so we can correlate with success/failure later.
-          // Same rule as outcome events: only where something reads them back.
-          // Pi has no resolver hook, and `getInjectionStats` — the only reader of
-          // this table — has no callers at all, so by default these rows would be
-          // written and never read.
+          // Pi has no resolver hook, and `getInjectionStats` — this table's only
+          // reader — has no callers, so by default these rows go unread.
           if (shouldRecordOutcomes('pi')) {
             try {
               const outcomeStorage = OutcomeStorage.getInstance();
