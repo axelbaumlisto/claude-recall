@@ -749,6 +749,45 @@ describe('Pi Extension', () => {
         .toBeLessThan(mockRunCycle.mock.invocationCallOrder[0]);
     });
 
+    it('has finished its work by the time Pi is told the handler is done', async () => {
+      // Pi awaits this handler and then calls process.exit. Work the handler
+      // merely started is cut off there, so "done" must mean done.
+      let closeBatch: (results: null) => void = () => {};
+      mockClassifyBatchWithLLM.mockImplementationOnce(() => new Promise(resolve => { closeBatch = resolve; }));
+      const ctx = mockCtx('/home/user/test-project');
+      api._handlers['session_start']({ type: 'session_start' }, ctx);
+      api._handlers['input']({ type: 'input', text: 'please always run the linter before committing', source: 'interactive' }, ctx);
+      mockUpdateEpisode.mockClear();
+
+      let handlerDone = false;
+      const handler = Promise.resolve(
+        api._handlers['session_shutdown']({ type: 'session_shutdown', reason: 'quit' }, ctx),
+      ).then(() => { handlerDone = true; });
+      await flush();
+
+      // The session's classification is still out: the handler must be too.
+      expect(handlerDone).toBe(false);
+      expect(mockUpdateEpisode).not.toHaveBeenCalled();
+
+      closeBatch(null);
+      await handler;
+
+      expect(mockUpdateEpisode).toHaveBeenCalledTimes(1);
+    });
+
+    it('does not hold up a session that is only being replaced', async () => {
+      // On /new, /resume or a fork the process lives on; the work finishes
+      // behind the new session instead of in front of it.
+      mockClassifyBatchWithLLM.mockImplementationOnce(() => new Promise(() => {}));
+      const ctx = mockCtx('/home/user/test-project');
+      api._handlers['session_start']({ type: 'session_start' }, ctx);
+      api._handlers['input']({ type: 'input', text: 'please always run the linter before committing', source: 'interactive' }, ctx);
+
+      await expect(
+        api._handlers['session_shutdown']({ type: 'session_shutdown', reason: 'new' }, ctx),
+      ).resolves.toBeUndefined();
+    });
+
     it('keeps every buffered tool call distinguishable in a long session', async () => {
       const detect = jest.spyOn(require('../../src/hooks/failure-detectors'), 'detectFailures');
       const ctx = mockCtx('/home/user/test-project');
