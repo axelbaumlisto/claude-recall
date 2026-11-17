@@ -777,15 +777,25 @@ describe('Pi Extension', () => {
 
     it('does not hold up a session that is only being replaced', async () => {
       // On /new, /resume or a fork the process lives on; the work finishes
-      // behind the new session instead of in front of it.
-      mockClassifyBatchWithLLM.mockImplementationOnce(() => new Promise(() => {}));
-      const ctx = mockCtx('/home/user/test-project');
-      api._handlers['session_start']({ type: 'session_start' }, ctx);
-      api._handlers['input']({ type: 'input', text: 'please always run the linter before committing', source: 'interactive' }, ctx);
+      // behind the new session instead of in front of it. Fake timers, so that
+      // "returns" cannot mean "returns once the budget has run out".
+      jest.useFakeTimers();
+      try {
+        mockClassifyBatchWithLLM.mockImplementationOnce(() => new Promise(() => {}));
+        const ctx = mockCtx('/home/user/test-project');
+        api._handlers['session_start']({ type: 'session_start' }, ctx);
+        api._handlers['input']({ type: 'input', text: 'please always run the linter before committing', source: 'interactive' }, ctx);
 
-      await expect(
-        api._handlers['session_shutdown']({ type: 'session_shutdown', reason: 'new' }, ctx),
-      ).resolves.toBeUndefined();
+        let handlerDone = false;
+        void Promise.resolve(
+          api._handlers['session_shutdown']({ type: 'session_shutdown', reason: 'new' }, ctx),
+        ).then(() => { handlerDone = true; });
+        await jest.advanceTimersByTimeAsync(0);
+
+        expect(handlerDone).toBe(true);
+      } finally {
+        jest.useRealTimers();
+      }
     });
 
     it('keeps every buffered tool call distinguishable in a long session', async () => {
