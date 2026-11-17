@@ -166,35 +166,42 @@ export function storeDetectedFailures(
   }
 }
 
+export interface PromotionResult {
+  promoted: number;
+  archived: number;
+}
+
 /**
  * Promote candidate lessons that have earned it. Never throws: a session must
  * end whether or not its lessons could be promoted.
  */
-export function runPromotionCycle(projectId: string): void {
+export function runPromotionCycle(projectId: string): PromotionResult {
   try {
     const result = PromotionEngine.getInstance().runCycle(projectId);
     if (result.promoted > 0 || result.archived > 0) {
       hookLog(LOG_TAG, `Promotion: ${result.promoted} promoted, ${result.archived} archived`);
     }
+    return result;
   } catch (err) {
     hookLog(LOG_TAG, `Promotion error: ${safeErrorMessage(err)}`);
+    return { promoted: 0, archived: 0 };
   }
 }
 
 /**
- * The whole end-of-session pass, for any runtime: detect failures, distil them
- * into candidate lessons, promote what has earned it.
+ * The end-of-session pass for a runtime that holds its tool calls in memory:
+ * detect the session's failures, distil them into candidate lessons, then
+ * promote — once, after the lessons exist, so what a session taught can be
+ * promoted by that session. Never throws.
  *
- * `failures` lets a caller add failures it detected by other means (Claude
- * Code's PostToolUseFailure events). Never throws.
+ * Claude Code composes the same three steps itself: it reads a transcript
+ * rather than holding interactions, and needs the failure count in between.
  */
 export async function distilSession(input: {
-  entries: object[];
   projectId: string;
+  /** The episode this session already opened; lessons are filed under it. */
   episodeId: string;
-  /** Interactions the runtime already has, when it has them (Pi). */
   interactions?: ToolInteraction[];
-  failures?: DetectedFailure[];
   /**
    * Stop distilling after this long and promote what is already stored.
    * In-process runtimes keep the process alive while this works, so an
@@ -203,13 +210,14 @@ export async function distilSession(input: {
    * to finish, so the exit is late by at most that one call.
    */
   deadlineMs?: number;
-}): Promise<void> {
-  const detected = storeDetectedFailures(input.entries, input.interactions);
-  const all = [...detected, ...(input.failures ?? [])];
+}): Promise<PromotionResult> {
+  const failures = input.interactions?.length
+    ? storeDetectedFailures([], input.interactions)
+    : [];
 
-  if (all.length > 0) {
+  if (failures.length > 0) {
     const stop = new AbortController();
-    const lessons = generateCandidateLessons(all, input.episodeId, input.projectId, stop.signal);
+    const lessons = generateCandidateLessons(failures, input.episodeId, input.projectId, stop.signal);
     if (input.deadlineMs === undefined) {
       await lessons;
     } else {
@@ -226,5 +234,5 @@ export async function distilSession(input: {
     }
   }
 
-  runPromotionCycle(input.projectId);
+  return runPromotionCycle(input.projectId);
 }

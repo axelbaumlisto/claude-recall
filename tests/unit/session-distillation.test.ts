@@ -26,7 +26,7 @@ jest.mock('../../src/services/promotion-engine', () => ({
   PromotionEngine: { getInstance: () => ({ runCycle: mockRunCycle }) },
 }));
 jest.mock('../../src/hooks/llm-classifier', () => ({ extractHindsightHint: mockHint }));
-jest.mock('../../src/hooks/failure-detectors', () => ({ detectTranscriptFailures: mockDetect }));
+jest.mock('../../src/hooks/failure-detectors', () => ({ detectTranscriptFailures: mockDetect, detectFailures: mockDetect }));
 jest.mock('../../src/hooks/shared', () => ({
   hookLog: jest.fn(),
   safeErrorMessage: (e: any) => String(e),
@@ -101,10 +101,13 @@ describe('session distillation', () => {
   });
 
   describe('distilSession', () => {
+    /** A session that made tool calls; what they were is the detector's business. */
+    const session = [{ call: { id: 't1', name: 'bash', input: {}, entryIndex: 0 } }] as any;
+
     it('turns a detected failure into a candidate lesson, then promotes', async () => {
       mockDetect.mockReturnValue([failure('npm test exited 1')]);
 
-      await distilSession({ entries: [{ role: 'assistant' }], projectId: 'proj', episodeId: 'ep1' });
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
 
       expect(mockCreateLesson).toHaveBeenCalledTimes(1);
       expect(mockCreateLesson.mock.calls[0][0]).toMatchObject({ project_id: 'proj', episode_id: 'ep1' });
@@ -115,7 +118,7 @@ describe('session distillation', () => {
       mockDetect.mockReturnValue([failure('npm test exited 1')]);
       mockHint.mockResolvedValue({ hint_text: 'run the suite before claiming done', hint_kind: 'rule', applies_when: ['tests'] });
 
-      await distilSession({ entries: [{ role: 'assistant' }], projectId: 'proj', episodeId: 'ep1' });
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
 
       expect(mockCreateLesson.mock.calls[0][0]).toMatchObject({
         lesson_text: 'run the suite before claiming done',
@@ -128,7 +131,7 @@ describe('session distillation', () => {
       mockDetect.mockReturnValue([failure('npm test exited 1')]);
       mockFindSimilar.mockReturnValue([{ id: 'lesson-1' }]);
 
-      await distilSession({ entries: [{ role: 'assistant' }], projectId: 'proj', episodeId: 'ep1' });
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
 
       // The repeat counts as evidence, and the model is never asked.
       expect(mockIncrementEvidence).toHaveBeenCalledWith('lesson-1');
@@ -139,7 +142,7 @@ describe('session distillation', () => {
       mockDetect.mockReturnValue([failure('a brand new failure')]);
       mockFindSimilar.mockReturnValue([]);
 
-      await distilSession({ entries: [{ role: 'assistant' }], projectId: 'proj', episodeId: 'ep1' });
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
 
       expect(mockHint).toHaveBeenCalledTimes(1);
     });
@@ -148,7 +151,7 @@ describe('session distillation', () => {
       mockDetect.mockReturnValue([failure('npm test exited 1')]);
       mockFindSimilar.mockReturnValue([{ id: 'lesson-1' }]);
 
-      await distilSession({ entries: [{ role: 'assistant' }], projectId: 'proj', episodeId: 'ep1' });
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
 
       expect(mockIncrementEvidence).toHaveBeenCalledWith('lesson-1');
       expect(mockCreateLesson).not.toHaveBeenCalled();
@@ -157,7 +160,7 @@ describe('session distillation', () => {
     it('ignores low-confidence detections', async () => {
       mockDetect.mockReturnValue([failure('maybe something broke', 0.3)]);
 
-      await distilSession({ entries: [{ role: 'assistant' }], projectId: 'proj', episodeId: 'ep1' });
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
 
       expect(mockCreateLesson).not.toHaveBeenCalled();
     });
@@ -165,22 +168,19 @@ describe('session distillation', () => {
     it('still runs promotion when the session had no failures', async () => {
       mockDetect.mockReturnValue([]);
 
-      await distilSession({ entries: [{ role: 'assistant' }], projectId: 'proj', episodeId: 'ep1' });
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
 
       expect(mockRunCycle).toHaveBeenCalledWith('proj');
     });
 
-    it('accepts failures the caller detected by other means', async () => {
-      mockDetect.mockReturnValue([]);
+    it('is the promotion cycle alone for a runtime that kept no tool calls', async () => {
+      mockRunCycle.mockReturnValue({ promoted: 2, archived: 1 });
 
-      await distilSession({
-        entries: [],
-        projectId: 'proj',
-        episodeId: 'ep1',
-        failures: [failure('tool reported an error') as any],
-      });
+      await expect(distilSession({ projectId: 'proj', episodeId: 'ep1' }))
+        .resolves.toEqual({ promoted: 2, archived: 1 });
 
-      expect(mockCreateLesson).toHaveBeenCalledTimes(1);
+      expect(mockDetect).not.toHaveBeenCalled();
+      expect(mockCreateLesson).not.toHaveBeenCalled();
     });
   });
 
@@ -193,9 +193,10 @@ describe('session distillation', () => {
       jest.useFakeTimers();
       let answerFirst: (hint: null) => void = () => {};
       mockHint.mockImplementationOnce(() => new Promise(resolve => { answerFirst = resolve; }));
-      const failures = ['a', 'b', 'c'].map(name => failure(`command ${name} exited 1`)) as any;
+      mockDetect.mockReturnValue(['a', 'b', 'c'].map(name => failure(`command ${name} exited 1`)));
+      const session = [{ call: { id: 't1', name: 'bash', input: {}, entryIndex: 0 } }] as any;
 
-      const done = distilSession({ entries: [], projectId: 'proj', episodeId: 'ep', failures, deadlineMs: 1000 });
+      const done = distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep', deadlineMs: 1000 });
       await jest.advanceTimersByTimeAsync(1000);
       await done;
       expect(mockRunCycle).toHaveBeenCalledTimes(1);
