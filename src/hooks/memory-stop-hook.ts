@@ -484,6 +484,18 @@ export async function generateCandidateLessons(
       if (opts.stop?.aborted) break;
       if (f.confidence < 0.7) continue;
 
+      // A failure seen before has its lesson on record under what failed, and
+      // seeing it again is evidence for that lesson — there is nothing to ask
+      // the model. The exception is a lesson that is still only the failure
+      // restated: that one is worth asking about once more, further down.
+      const onRecord = outcomeStorage.findLessonForFailure(f.content.what_failed, projectId);
+      const stillARestatement = onRecord?.status === 'candidate'
+        && onRecord.lesson_text.endsWith(`(failure: ${f.content.what_failed})`);
+      if (onRecord && !stillARestatement) {
+        outcomeStorage.incrementEvidenceCount(onRecord.id);
+        continue;
+      }
+
       let lessonText = `${f.content.what_should_do} (failure: ${f.content.what_failed})`;
       let lessonKind = 'failure_preventer';
       let appliesWhen = extractTagsFromContext(f.content.context);
@@ -506,6 +518,16 @@ export async function generateCandidateLessons(
         }
       }
 
+      if (onRecord) {
+        // The restatement on record: the model's hindsight replaces it when
+        // there is some, and either way the failure was seen again.
+        if (hint) outcomeStorage.rewordLesson(onRecord.id, lessonText, lessonKind, appliesWhen);
+        outcomeStorage.incrementEvidenceCount(onRecord.id);
+        continue;
+      }
+
+      // Lessons recorded before failures were keyed have only their text to go
+      // by, and the same advice can be reached from two different failures.
       const similar = outcomeStorage.findSimilarLessons(lessonText, projectId);
       if (similar.length > 0) {
         outcomeStorage.incrementEvidenceCount(similar[0].id);
@@ -520,6 +542,7 @@ export async function generateCandidateLessons(
           reward_band: -1,
           confidence: f.confidence,
           durability: 'project',
+          failure_key: f.content.what_failed,
         });
       }
     }
