@@ -32,7 +32,7 @@ jest.mock('../../src/hooks/shared', () => ({
   safeErrorMessage: (e: any) => String(e),
   searchExisting: mockSearchExisting,
   isDuplicate: jest.requireActual('../../src/hooks/shared').isDuplicate,
-  comparableText: jest.requireActual('../../src/hooks/shared').comparableText,
+  jaccardSimilarity: jest.requireActual('../../src/hooks/shared').jaccardSimilarity,
 }));
 
 import { distilSession, runPromotionCycle, storeDetectedFailures } from '../../src/shared/session-distillation';
@@ -46,7 +46,7 @@ describe('session distillation', () => {
   const failure = (what: string, confidence = 0.9) => ({
     signal: 'non-zero-exit',
     confidence,
-    content: { what_failed: what, what_should_do: 'check the command', context: 'running tests' },
+    content: { what_failed: what, why_failed: 'Exit code 1', what_should_do: 'check the command', context: 'running tests' },
   });
 
   beforeEach(() => {
@@ -58,33 +58,51 @@ describe('session distillation', () => {
   });
 
   describe('storeDetectedFailures', () => {
-    it('stores what the detector found, as failure memories', () => {
-      mockDetect.mockReturnValue([failure('npm test exited 1')]);
+    it('stores a new failure in the shape the Stop hook has always written', () => {
+      mockDetect.mockReturnValue([{
+        signal: 'non-zero-exit',
+        confidence: 0.85,
+        content: { what_failed: 'npm test exited 1', why_failed: 'Exit code 1: 3 failing', what_should_do: 'check', context: 'tests' },
+      }]);
 
-      const stored = storeDetectedFailures([{ role: 'assistant' }]);
+      storeDetectedFailures([{ role: 'assistant' }]);
 
-      expect(stored).toHaveLength(1);
+      // Other readers of these rows expect this layout; moving the code into a
+      // shared module is not a licence to change what it writes.
       expect(mockStore).toHaveBeenCalledTimes(1);
-      expect(mockStore.mock.calls[0][0].type).toBe('failure');
+      expect(mockStore.mock.calls[0][0]).toMatchObject({
+        type: 'failure',
+        relevanceScore: 0.85,
+        value: {
+          title: 'Avoid: npm test exited 1',
+          description: 'Exit code 1: 3 failing',
+          content: { what_failed: 'npm test exited 1' },
+        },
+      });
     });
 
-    it('recognises a repeat of a detector-written failure, not just a captured one', () => {
-      // Stored failures carry { what_failed, why_failed, … }; comparing against
-      // the whole JSON blob used to drown the text and let repeats through.
-      mockDetect.mockReturnValue([failure('npm test exited 1')]);
-      mockSearchExisting.mockReturnValue([
-        { value: { what_failed: 'npm test exited 1', why_failed: 'Exit code 1', context: 'tests' }, score: 1 },
-      ]);
+    it('returns every failure it detected, including the ones already on record', () => {
+      // Storing and learning are different questions. A repeat must not be
+      // stored twice, but it is exactly what a lesson gains evidence from.
+      mockDetect.mockReturnValue([failure('npm test exited 1'), failure('cargo build exited 101')]);
+      mockSearchExisting.mockImplementation((query: string) =>
+        query.startsWith('npm test') ? [{ value: { what_failed: 'npm test exited 1' }, score: 1 }] : []);
 
-      expect(storeDetectedFailures([{ role: 'assistant' }])).toHaveLength(0);
-      expect(mockStore).not.toHaveBeenCalled();
+      const detected = storeDetectedFailures([{ role: 'assistant' }]);
+
+      expect(detected.map(f => f.content.what_failed)).toEqual(['npm test exited 1', 'cargo build exited 101']);
+      expect(mockStore).toHaveBeenCalledTimes(1);
     });
 
-    it('skips a failure already stored', () => {
+    it.each([
+      ['captured as the tool failed', { content: 'npm test exited 1. Exit code 1', what_failed: 'npm test exited 1', why_failed: 'Exit code 1', what_should_do: 'Check command syntax, file paths, and prerequisites before running', context: 'Bash command returned non-zero exit code 1', preventative_checks: ['Verify tool inputs are correct'] }],
+      ['written by an earlier detector pass', { title: 'Avoid: npm test exited 1', description: 'Exit code 1', content: { what_failed: 'npm test exited 1', why_failed: 'Exit code 1', context: 'tests' } }],
+    ])('does not store a failure again when it was %s', (_how, stored) => {
       mockDetect.mockReturnValue([failure('npm test exited 1')]);
-      mockSearchExisting.mockReturnValue([{ value: { what_failed: 'npm test exited 1' }, score: 1 }]);
+      mockSearchExisting.mockReturnValue([{ value: stored, score: 1 }]);
 
-      expect(storeDetectedFailures([{ role: 'assistant' }])).toHaveLength(0);
+      storeDetectedFailures([{ role: 'assistant' }]);
+
       expect(mockStore).not.toHaveBeenCalled();
     });
 
@@ -127,26 +145,6 @@ describe('session distillation', () => {
       });
     });
 
-    it('does not pay for hindsight about a failure it already learned from', async () => {
-      mockDetect.mockReturnValue([failure('npm test exited 1')]);
-      mockFindSimilar.mockReturnValue([{ id: 'lesson-1' }]);
-
-      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
-
-      // The repeat counts as evidence, and the model is never asked.
-      expect(mockIncrementEvidence).toHaveBeenCalledWith('lesson-1');
-      expect(mockHint).not.toHaveBeenCalled();
-    });
-
-    it('asks the model only about a failure it has not seen', async () => {
-      mockDetect.mockReturnValue([failure('a brand new failure')]);
-      mockFindSimilar.mockReturnValue([]);
-
-      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
-
-      expect(mockHint).toHaveBeenCalledTimes(1);
-    });
-
     it('counts evidence instead of duplicating an existing lesson', async () => {
       mockDetect.mockReturnValue([failure('npm test exited 1')]);
       mockFindSimilar.mockReturnValue([{ id: 'lesson-1' }]);
@@ -163,6 +161,18 @@ describe('session distillation', () => {
       await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
 
       expect(mockCreateLesson).not.toHaveBeenCalled();
+    });
+
+    it('learns from a failure even when its memory is already on record', async () => {
+      // Under Pi every failure is captured as the tool fails, so by session end
+      // each one is "already stored". That must not cost it its lesson.
+      mockDetect.mockReturnValue([failure('npm test exited 1')]);
+      mockSearchExisting.mockReturnValue([{ value: { what_failed: 'npm test exited 1' }, score: 1 }]);
+
+      await distilSession({ interactions: session, projectId: 'proj', episodeId: 'ep1' });
+
+      expect(mockStore).not.toHaveBeenCalled();
+      expect(mockCreateLesson).toHaveBeenCalledTimes(1);
     });
 
     it('still runs promotion when the session had no failures', async () => {

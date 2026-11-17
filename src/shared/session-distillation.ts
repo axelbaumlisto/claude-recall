@@ -15,7 +15,7 @@ import { PromotionEngine } from '../services/promotion-engine';
 import { extractHindsightHint } from '../hooks/llm-classifier';
 import { DetectedFailure, detectFailures, detectTranscriptFailures } from '../hooks/failure-detectors';
 import type { ToolInteraction } from '../hooks/shared';
-import { hookLog, isDuplicate, safeErrorMessage, searchExisting } from '../hooks/shared';
+import { hookLog, isDuplicate, jaccardSimilarity, safeErrorMessage, searchExisting } from '../hooks/shared';
 
 const LOG_TAG = 'session-distillation';
 
@@ -45,14 +45,6 @@ export async function generateCandidateLessons(
 ): Promise<void> {
   try {
     const outcomeStorage = OutcomeStorage.getInstance();
-
-    /** A lesson already on record gains evidence instead of a duplicate. */
-    const countedAsEvidence = (text: string): boolean => {
-      const [known] = outcomeStorage.findSimilarLessons(text, projectId);
-      if (known) outcomeStorage.incrementEvidenceCount(known.id);
-      return known !== undefined;
-    };
-
     // Each hint is an LLM call (via the subscription CLI it can take seconds),
     // and this loop runs INLINE in the Stop hook's ~40s budget — cap the LLM
     // calls per run; failures past the cap keep the grounded generic lesson.
@@ -63,14 +55,7 @@ export async function generateCandidateLessons(
       if (stop?.aborted) break;
       if (f.confidence < 0.7) continue;
 
-      // The grounded text already names what failed, so a repeat of the same
-      // failure matches here — and then there is nothing to ask the model
-      // about. Hindsight was being bought before this check, so every repeat
-      // of a known failure paid for a call and threw the answer away.
-      const grounded = `${f.content.what_should_do} (failure: ${f.content.what_failed})`;
-      if (countedAsEvidence(grounded)) continue;
-
-      let lessonText = grounded;
+      let lessonText = `${f.content.what_should_do} (failure: ${f.content.what_failed})`;
       let lessonKind = 'failure_preventer';
       let appliesWhen = extractTagsFromContext(f.content.context);
 
@@ -88,19 +73,22 @@ export async function generateCandidateLessons(
         }
       }
 
-      if (countedAsEvidence(lessonText)) continue;
-
-      outcomeStorage.createCandidateLesson({
-        project_id: projectId,
-        episode_id: episodeId,
-        lesson_text: lessonText,
-        lesson_kind: lessonKind,
-        applies_when: appliesWhen,
-        outcome_type: 'negative',
-        reward_band: -1,
-        confidence: f.confidence,
-        durability: 'project',
-      });
+      const similar = outcomeStorage.findSimilarLessons(lessonText, projectId);
+      if (similar.length > 0) {
+        outcomeStorage.incrementEvidenceCount(similar[0].id);
+      } else {
+        outcomeStorage.createCandidateLesson({
+          project_id: projectId,
+          episode_id: episodeId,
+          lesson_text: lessonText,
+          lesson_kind: lessonKind,
+          applies_when: appliesWhen,
+          outcome_type: 'negative',
+          reward_band: -1,
+          confidence: f.confidence,
+          durability: 'project',
+        });
+      }
     }
   } catch (err) {
     hookLog(LOG_TAG, `Candidate lesson generation error: ${safeErrorMessage(err)}`);
@@ -120,50 +108,83 @@ function extractTagsFromContext(context: string): string[] {
   return tags;
 }
 
-/**
- * Detect the failures a session left behind and store them as memories.
- *
- * Takes entries rather than a transcript path: Claude Code reads them from its
- * transcript file, Pi already holds them in memory, and the detector never
- * cared where they came from.
- */
-export function storeDetectedFailures(
-  entries: object[],
-  interactions?: ToolInteraction[],
-): DetectedFailure[] {
-  try {
-    if (entries.length === 0 && !interactions?.length) return [];
+/** Similarity above which a detected failure is one already stored. */
+const KNOWN_FAILURE_THRESHOLD = 0.6;
 
-    // Pi passes interactions it already holds; Claude Code passes transcript
-    // entries and lets the detector reconstruct them.
-    const failures = interactions
-      ? detectFailures(interactions, entries)
-      : detectTranscriptFailures(entries);
+/** `what_failed` of a stored failure, wherever its writer put it. */
+function storedWhatFailed(value: unknown): string | undefined {
+  const v = value as { what_failed?: unknown; content?: { what_failed?: unknown } } | null;
+  if (typeof v?.what_failed === 'string') return v.what_failed; // captured as the tool failed
+  if (typeof v?.content?.what_failed === 'string') return v.content.what_failed; // written by storeNew()
+  return undefined;
+}
+
+/**
+ * Whether a detected failure is already on record.
+ *
+ * `isDuplicate` compares against the stored value as one JSON blob, where the
+ * failing command is a small part of field names, remedies and context: the
+ * same failure scored under the threshold and was stored again, at every
+ * session end. Stored failures say what failed in a field of their own, so
+ * that is compared first; `isDuplicate` still catches whatever it caught.
+ */
+function alreadyOnRecord(whatFailed: string): boolean {
+  const existing = searchExisting(whatFailed.substring(0, 100));
+  return isDuplicate(whatFailed, existing, KNOWN_FAILURE_THRESHOLD)
+    || existing.some((memory) => {
+      const stored = storedWhatFailed(memory.value);
+      return stored !== undefined && jaccardSimilarity(whatFailed, stored) >= KNOWN_FAILURE_THRESHOLD;
+    });
+}
+
+/**
+ * Run a detector, store the failures not yet on record, and hand back every
+ * failure it found.
+ *
+ * All of them, not only the new ones: storing and learning are different
+ * questions. A failure seen before must not be stored twice, but a repeat is
+ * exactly what a candidate lesson gains evidence from.
+ */
+function storeNew(detect: () => DetectedFailure[]): DetectedFailure[] {
+  try {
+    const failures = detect();
     if (failures.length === 0) return [];
 
     const projectId = ConfigService.getInstance().getProjectId();
     const memoryService = MemoryService.getInstance();
-    const stored: DetectedFailure[] = [];
+    let stored = 0;
 
     for (const failure of failures) {
-      const existing = searchExisting(failure.content.what_failed.substring(0, 100));
-      if (isDuplicate(failure.content.what_failed, existing, 0.6)) continue;
+      if (alreadyOnRecord(failure.content.what_failed)) continue;
 
       memoryService.store({
         key: `hook_failure_${failure.signal}_${Date.now()}_${Math.random().toString(36).substr(2, 9)}`,
-        value: failure.content,
+        value: {
+          title: `Avoid: ${failure.content.what_failed.substring(0, 50)}`,
+          description: failure.content.why_failed.substring(0, 100),
+          content: failure.content,
+        },
         type: 'failure',
         context: { projectId, timestamp: Date.now() },
+        relevanceScore: failure.confidence,
       });
-      stored.push(failure);
+      stored++;
     }
 
-    hookLog(LOG_TAG, `Stored ${stored.length} of ${failures.length} detected failure(s)`);
-    return stored;
+    hookLog(LOG_TAG, `Stored ${stored} failure(s) from ${failures.length} detected`);
+    return failures;
   } catch (err) {
     hookLog(LOG_TAG, `Failure detection error: ${safeErrorMessage(err)}`);
     return [];
   }
+}
+
+/**
+ * Detect the failures in a transcript and store the new ones — what Claude
+ * Code's Stop hook does with the tail of its transcript file.
+ */
+export function storeDetectedFailures(entries: object[]): DetectedFailure[] {
+  return entries.length === 0 ? [] : storeNew(() => detectTranscriptFailures(entries));
 }
 
 export interface PromotionResult {
@@ -211,9 +232,8 @@ export async function distilSession(input: {
    */
   deadlineMs?: number;
 }): Promise<PromotionResult> {
-  const failures = input.interactions?.length
-    ? storeDetectedFailures([], input.interactions)
-    : [];
+  const { interactions } = input;
+  const failures = interactions?.length ? storeNew(() => detectFailures(interactions)) : [];
 
   if (failures.length > 0) {
     const stop = new AbortController();
