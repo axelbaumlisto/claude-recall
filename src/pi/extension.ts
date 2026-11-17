@@ -13,7 +13,6 @@ import { OutcomeStorage } from '../services/outcome-storage';
 import { LoggingService } from '../services/logging';
 import { DatabaseManager } from '../services/database-manager';
 import { shouldRecordOutcomes } from '../shared/outcome-capture';
-import { distilSession } from '../shared/session-distillation';
 import type { ToolInteraction as PiToolInteraction } from '../hooks/shared';
 import {
   processToolOutcome,
@@ -123,6 +122,12 @@ export default function(pi: PiTypes.ExtensionAPI) {
   const collectedToolResults: ConversationEntry[] = [];
   /** Tool calls and their outcomes, in the shape the failure detectors want. */
   const toolInteractions: PiToolInteraction[] = [];
+  /**
+   * Position of a tool call in the session. The detectors tell calls apart by
+   * it, so it has to keep counting when the buffer below starts dropping its
+   * oldest entries — the buffer's length stops moving at the cap.
+   */
+  let toolCallSeq = 0;
   let rulesLoaded = false;
   /** Rules injected into the current turn — the only candidates for its citations. */
   let injectedThisTurn: CitableRule[] = [];
@@ -148,6 +153,7 @@ export default function(pi: PiTypes.ExtensionAPI) {
     collectedToolResults.length = 0;
     collectedEntries.length = 0;
     toolInteractions.length = 0;
+    toolCallSeq = 0;
     resetPendingFailures();
     try {
       ConfigService.getInstance().updateConfig({
@@ -303,19 +309,10 @@ export default function(pi: PiTypes.ExtensionAPI) {
     const result = processToolOutcome(event.toolName, event.input, output, event.isError, sessionId, 'pi');
 
     // Collect for session extraction
+    const entryIndex = toolCallSeq++;
     toolInteractions.push({
-      call: {
-        id: event.toolCallId,
-        name: event.toolName,
-        input: event.input,
-        entryIndex: toolInteractions.length,
-      },
-      result: {
-        toolUseId: event.toolCallId,
-        content: output,
-        isError: event.isError,
-        entryIndex: toolInteractions.length,
-      },
+      call: { id: event.toolCallId, name: event.toolName, input: event.input, entryIndex },
+      result: { toolUseId: event.toolCallId, content: output, isError: event.isError, entryIndex },
     });
     if (toolInteractions.length > MAX_COLLECTED_ENTRIES) toolInteractions.shift();
 
@@ -370,7 +367,15 @@ export default function(pi: PiTypes.ExtensionAPI) {
   // --- Event: session end — episode + promotion + session extraction ---
 
   pi.on('session_shutdown', (_event, ctx) => {
-    processSessionEnd(collectedUserTexts, sessionId, projectId).then(result => {
+    // The session's failures are distilled into lessons here too. Until now
+    // that ran only from Claude Code's Stop hook, so on a Pi host failures
+    // accumulated as rules and never became lessons. Bounded: Pi keeps the
+    // process alive until this resolves, and a session must not take a minute
+    // to exit because it is still asking about failures.
+    const work = projectId
+      ? { interactions: toolInteractions, deadlineMs: DISTILLATION_DEADLINE_MS }
+      : {};
+    processSessionEnd(collectedUserTexts, sessionId, projectId, undefined, work).then(result => {
       if (ctx.hasUI) {
         try {
           if (result.stored > 0) {
@@ -394,30 +399,6 @@ export default function(pi: PiTypes.ExtensionAPI) {
           try { ctx.ui.notify(`🔍 Recall: extracted ${extracted} learnings from session`, 'info'); } catch { /* non-critical */ }
         }
       }).catch(() => {});
-    }
-
-    // Distil this session's failures into candidate lessons and promote what
-    // has earned it. Until now this ran only from Claude Code's Stop hook, so
-    // on a Pi host failures accumulated as rules and never became lessons.
-    // Bounded: Pi keeps the process alive until this resolves, and a session
-    // must not take a minute to exit because it is still asking about failures.
-    if (collectedEntries.length > 0 && projectId) {
-      void (async () => {
-        try {
-          const episodeId = OutcomeStorage.getInstance().createEpisode({
-            project_id: projectId,
-            session_id: sessionId,
-            source: 'pi',
-          } as any);
-          await distilSession({
-            entries: collectedEntries,
-            projectId,
-            episodeId,
-            interactions: toolInteractions,
-            deadlineMs: DISTILLATION_DEADLINE_MS,
-          });
-        } catch { /* a session must end whether or not it taught us anything */ }
-      })();
     }
 
     // Auto-checkpoint: extract "where I left off" hint for next Pi session.

@@ -15,6 +15,7 @@ import {
   jaccardSimilarity,
   safeErrorMessage,
 } from '../hooks/shared';
+import type { ToolInteraction } from '../hooks/shared';
 import { extractSessionLearningsWithLLM, extractCheckpointWithLLM } from '../hooks/llm-classifier';
 import { MemoryService } from '../services/memory';
 import { OutcomeStorage } from '../services/outcome-storage';
@@ -311,6 +312,8 @@ export async function processSessionEnd(
   sessionId: string,
   projectId: string,
   maxStore: number = 3,
+  /** What the session did, when the runtime kept it: its failures become lessons. */
+  work: { interactions?: ToolInteraction[]; deadlineMs?: number } = {},
 ): Promise<{ stored: number; promoted: number }> {
   let stored = 0;
   let promoted = 0;
@@ -354,10 +357,12 @@ export async function processSessionEnd(
       outcome_summary: `Session end: ${stored} memories captured`,
     });
 
-    // Run promotion cycle
+    // Distil what the session did into candidate lessons, then promote —
+    // under this session's own episode, and once. With nothing to distil this
+    // is the promotion cycle alone, as before.
     try {
-      const { PromotionEngine } = await import('../services/promotion-engine');
-      const result = PromotionEngine.getInstance().runCycle(projectId);
+      const { distilSession } = await import('./session-distillation');
+      const result = await distilSession({ projectId, episodeId, ...work });
       promoted = result.promoted;
     } catch {
       // Non-critical
