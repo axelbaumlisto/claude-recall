@@ -13,7 +13,6 @@ import { OutcomeStorage } from '../services/outcome-storage';
 import { LoggingService } from '../services/logging';
 import { DatabaseManager } from '../services/database-manager';
 import { shouldRecordOutcomes } from '../shared/outcome-capture';
-import { CitableRule, extractCitations, matchCitations } from '../shared/citations';
 import { distilSession } from '../shared/session-distillation';
 import type { ToolInteraction as PiToolInteraction } from '../hooks/shared';
 import {
@@ -28,6 +27,8 @@ import {
   ConversationEntry,
 } from '../shared/event-processors';
 import { rankRulesForToolCall, Rule, RankedRule } from '../services/rule-retrieval';
+import { CitableRule, extractCitations, matchCitations } from '../shared/citations';
+import { announcePiHost } from '../hooks/pi-classifier';
 // Shared audited directive — memories are advisory user preferences, never
 // authoritative instructions (prompt-injection hardening, 2026-04-24 audit).
 import { LOAD_RULES_DIRECTIVE } from '../shared/directives';
@@ -102,17 +103,17 @@ function formatRules(rules: ActiveRules): string {
 }
 
 export default function(pi: PiTypes.ExtensionAPI) {
-  // Announce the runtime so the LLM backends know Pi's headless mode is
-  // available. Without this they would have to probe PATH, and a Claude Code
-  // user who also has Pi installed would get their hooks answered by it.
-  process.env.CLAUDE_RECALL_RUNTIME = 'pi';
-
   // A nested session spawned by our own LLM backend must stay a plain Pi run:
-  // no capture, no distillation, no citations — otherwise asking the model why
-  // a command failed would itself become a session that asks why a command
-  // failed. The backend prefers `--no-extensions`, which makes this moot, but a
-  // host whose models come from an extension has to load them.
+  // no rules injected, nothing captured — otherwise asking the model to
+  // summarise a session would itself become a session to summarise. The
+  // backend prefers `--no-extensions`, which makes this moot, but a host whose
+  // models come from an extension has to load them.
   if (process.env.CLAUDE_RECALL_NESTED === '1') return;
+
+  // Tell the LLM backends this process is a Pi host, so Pi's headless mode is
+  // theirs to use if the user opted in. In-process on purpose — see
+  // announcePiHost().
+  announcePiHost();
 
   /** Longest a session may spend distilling before it is allowed to exit. */
   const DISTILLATION_DEADLINE_MS = 20000;
