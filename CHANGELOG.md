@@ -24,6 +24,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **One telemetry cleanup, not two.** `OutcomeStorage.pruneOldData()` already dropped the same tables on a hard-coded 90-day clock, so a second pass inside compaction would have left the database with two windows. The age limit and the unreferenced-episode rule now live in `pruneOutcomeData()`, which both the hook path and `compact()` call on their own connection.
 - **`getCompactionConfig` merges the stored config over the defaults** instead of replacing them. A config file written before this change has a `compaction` block without the new retention keys, and an undefined cap would reach `scored.slice(keepCount)` and select every row for deletion.
 
+- **Raw outcome telemetry is no longer collected on runtimes that cannot consume it.** `outcome_events` and `rule_injection_events` are written one row per tool result so that `memory-stop-hook` can later distill them into `candidate_lessons` and citation counts — but that hook is wired into Claude Code's hook CLI only. Under Pi the rows were therefore written and never read: one host reached **246845 `outcome_events` rows, about two thirds of a 133MB database, with `candidate_lessons` still empty and every `cite_count` at zero**. `rule_injection_events` is worse off still — `getInjectionStats`, its only reader, has no callers on any runtime. Collection now follows the consumer, via one pure policy function (`shouldRecordOutcomes`) that both writers consult.
+
+### Added
+
+- **`CLAUDE_RECALL_OUTCOME_TRACKING`** (`auto` | `on` | `off`, default `auto`). `auto` collects where the distillation step runs; `on` forces collection everywhere, which is what you want when reading the `outcomes` CLI or debugging capture; `off` disables it entirely. Failure memories are unaffected — Pi reads those back as rules. Every writer of these two tables consults the same policy — the Pi extension, Claude Code's `tool-outcome-watcher` and its `rule-injector` — so `off` is off on every runtime, not only where the default would already have stopped collecting.
+
 ## [0.47.0] - 2026-11-11
 
 ### Changed
