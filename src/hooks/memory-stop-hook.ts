@@ -484,6 +484,19 @@ export async function generateCandidateLessons(
       if (opts.stop?.aborted) break;
       if (f.confidence < 0.7) continue;
 
+      // A failure seen before has its lesson on record under what failed, and
+      // seeing it again is evidence for that lesson — there is nothing to ask
+      // the model. The exception is a lesson that is still only the failure
+      // restated: that one is worth asking about once more, further down.
+      const key = lessonKey(f);
+      const onRecord = key ? outcomeStorage.findLessonForFailure(key, projectId) : null;
+      const stillARestatement = onRecord?.status === 'candidate'
+        && onRecord.lesson_text.endsWith(`(failure: ${f.content.what_failed})`);
+      if (onRecord && !stillARestatement) {
+        outcomeStorage.incrementEvidenceCount(onRecord.id);
+        continue;
+      }
+
       let lessonText = `${f.content.what_should_do} (failure: ${f.content.what_failed})`;
       let lessonKind = 'failure_preventer';
       let appliesWhen = extractTagsFromContext(f.content.context);
@@ -506,6 +519,16 @@ export async function generateCandidateLessons(
         }
       }
 
+      if (onRecord) {
+        // The restatement on record: the model's hindsight replaces it when
+        // there is some, and either way the failure was seen again.
+        if (hint) outcomeStorage.rewordLesson(onRecord.id, lessonText, lessonKind, appliesWhen);
+        outcomeStorage.incrementEvidenceCount(onRecord.id);
+        continue;
+      }
+
+      // Lessons recorded before failures were keyed have only their text to go
+      // by, and the same advice can be reached from two different failures.
       const similar = outcomeStorage.findSimilarLessons(lessonText, projectId);
       if (similar.length > 0) {
         outcomeStorage.incrementEvidenceCount(similar[0].id);
@@ -520,11 +543,40 @@ export async function generateCandidateLessons(
           reward_band: -1,
           confidence: f.confidence,
           durability: 'project',
+          failure_key: key,
         });
       }
     }
   } catch (err) {
     hookLog('memory-stop', `Candidate lesson generation error: ${safeErrorMessage(err)}`);
+  }
+}
+
+/**
+ * What a failure's lesson is filed under — or nothing, when its description
+ * does not say what failed.
+ *
+ * "Command failed: terraform plan" names its subject: seen again, it is the
+ * same failure. "Read failed" does not — the file and the error are elsewhere
+ * — and neither does "Bash called 3 times with identical arguments". Filing
+ * those by their description would make every failed Read one failure, and
+ * promote the first one's lesson the second time any Read failed. They are
+ * left unkeyed and keep being matched by lesson text, as before.
+ *
+ * Decided by the detector's signal, not by parsing the sentence it wrote.
+ */
+function lessonKey(f: DetectedFailure): string | undefined {
+  const what = f.content.what_failed;
+  switch (f.signal) {
+    case 'non-zero-exit':
+    case 'silent-test-failure':
+      return what; // "<…>: <the command>"
+    case 'tool_failure':
+      // "<Tool> failed" and the "Tool failure" fallback carry no subject;
+      // "Bash command failed: <command>" and "Edit failed on <path>" do.
+      return /^\S+ failed$/.test(what) || what === 'Tool failure' ? undefined : what;
+    default:
+      return undefined;
   }
 }
 
